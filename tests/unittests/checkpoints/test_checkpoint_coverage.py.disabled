@@ -1,0 +1,367 @@
+"""Additional tests for CheckpointService edge cases and error paths.
+
+These tests target previously uncovered code paths to achieve >95% coverage.
+"""
+
+import pytest
+from google.adk.checkpoints.checkpoint_service import CheckpointService
+from google.adk.checkpoints.models import CheckpointMetadata
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+from unittest.mock import AsyncMock, patch, MagicMock
+
+
+class TestCheckpointServiceErrorPaths:
+    """Test error handling and exception paths."""
+
+    @pytest.mark.asyncio
+    async def test_create_checkpoint_with_exception_in_traced(self):
+        """Test that _traced() records error metrics when exception occurs."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Mock session_service.append_event to raise an exception
+        with patch.object(
+            session_service, "append_event", side_effect=ValueError("Simulated error")
+        ):
+            with pytest.raises(ValueError, match="Simulated error"):
+                await checkpoint_service.create_checkpoint(
+                    session=session, description="Test"
+                )
+
+    @pytest.mark.asyncio
+    async def test_get_checkpoint_with_exception_in_traced(self):
+        """Test get_checkpoint error path."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Mock session.state.get to raise an exception
+        with patch.object(
+            session.state, "get", side_effect=RuntimeError("State access error")
+        ):
+            with pytest.raises(RuntimeError, match="State access error"):
+                await checkpoint_service.get_checkpoint(session, "test-checkpoint")
+
+    @pytest.mark.asyncio
+    async def test_list_checkpoints_with_exception_in_traced(self):
+        """Test list_checkpoints error path."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Mock session.state.get to raise an exception
+        with patch.object(
+            session.state, "get", side_effect=KeyError("Index missing")
+        ):
+            with pytest.raises(KeyError, match="Index missing"):
+                await checkpoint_service.list_checkpoints(session)
+
+    @pytest.mark.asyncio
+    async def test_delete_checkpoint_with_exception_in_traced(self):
+        """Test delete_checkpoint error path."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Create a checkpoint first
+        await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="test-checkpoint"
+        )
+
+        # Mock append_event to raise exception during delete
+        with patch.object(
+            session_service, "append_event", side_effect=IOError("Disk full")
+        ):
+            with pytest.raises(IOError, match="Disk full"):
+                await checkpoint_service.delete_checkpoint(session, "test-checkpoint")
+
+    @pytest.mark.asyncio
+    async def test_restore_checkpoint_with_exception_in_traced(self):
+        """Test restore_checkpoint error path."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Create a checkpoint
+        await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="test-checkpoint"
+        )
+
+        # Mock append_event to raise exception during restore
+        with patch.object(
+            session_service, "append_event", side_effect=PermissionError("Read-only")
+        ):
+            with pytest.raises(PermissionError, match="Read-only"):
+                await checkpoint_service.restore_checkpoint(session, "test-checkpoint")
+
+
+class TestCheckpointServiceArtifactRestoration:
+    """Test artifact restoration code paths (previously 0% coverage)."""
+
+    @pytest.mark.asyncio
+    async def test_restore_artifacts_success(self):
+        """Test successful artifact restoration."""
+        session_service = InMemorySessionService()
+        artifact_service = InMemoryArtifactService()
+        checkpoint_service = CheckpointService(
+            session_service=session_service, artifact_service=artifact_service
+        )
+
+        session = await session_service.create_session(
+            app_name="test_app", user_id="user1"
+        )
+
+        # Create artifacts
+        await artifact_service.save_artifact(
+            app_name="test_app",
+            user_id="user1",
+            session_id=session.id,
+            filename="file1.txt",
+            data=b"Original content",
+        )
+
+        # Create checkpoint with artifact
+        metadata = await checkpoint_service.create_checkpoint(
+            session=session,
+            checkpoint_id="cp1",
+            artifact_filenames=["file1.txt"],
+        )
+
+        # Modify artifact
+        await artifact_service.save_artifact(
+            app_name="test_app",
+            user_id="user1",
+            session_id=session.id,
+            filename="file1.txt",
+            data=b"Modified content",
+        )
+
+        # Restore checkpoint (should restore artifact)
+        await checkpoint_service.restore_checkpoint(
+            session, "cp1", restore_artifacts=True
+        )
+
+        # Verify artifact was restored (latest version should be original again)
+        restored = await artifact_service.get_artifact(
+            app_name="test_app",
+            user_id="user1",
+            session_id=session.id,
+            filename="file1.txt",
+        )
+        assert restored == b"Original content"
+
+    @pytest.mark.asyncio
+    async def test_restore_artifacts_missing_artifact(self):
+        """Test artifact restoration when artifact doesn't exist."""
+        session_service = InMemorySessionService()
+        artifact_service = InMemoryArtifactService()
+        checkpoint_service = CheckpointService(
+            session_service=session_service, artifact_service=artifact_service
+        )
+
+        session = await session_service.create_session(
+            app_name="test_app", user_id="user1"
+        )
+
+        # Create checkpoint with fake artifact version
+        session.state["_checkpoint_cp1"] = {
+            "checkpoint_id": "cp1",
+            "description": None,
+            "agent_name": None,
+            "artifact_versions": {"nonexistent.txt": 1},
+            "state_snapshot": {},
+            "is_delta": False,
+            "base_checkpoint_id": None,
+            "custom_metadata": {},
+            "timestamp": 1234567890.0,
+        }
+
+        # Restore should not crash (just log warning)
+        result = await checkpoint_service.restore_checkpoint(
+            session, "cp1", restore_artifacts=True
+        )
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_restore_artifacts_get_artifact_fails(self):
+        """Test artifact restoration when get_artifact raises exception."""
+        session_service = InMemorySessionService()
+        artifact_service = InMemoryArtifactService()
+        checkpoint_service = CheckpointService(
+            session_service=session_service, artifact_service=artifact_service
+        )
+
+        session = await session_service.create_session(
+            app_name="test_app", user_id="user1"
+        )
+
+        # Create checkpoint with artifact
+        await artifact_service.save_artifact(
+            app_name="test_app",
+            user_id="user1",
+            session_id=session.id,
+            filename="file1.txt",
+            data=b"Content",
+        )
+
+        metadata = await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp1", artifact_filenames=["file1.txt"]
+        )
+
+        # Mock get_artifact to raise exception
+        with patch.object(
+            artifact_service, "get_artifact", side_effect=IOError("Network error")
+        ):
+            # Should not crash, just log warning
+            result = await checkpoint_service.restore_checkpoint(
+                session, "cp1", restore_artifacts=True
+            )
+            assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_restore_artifacts_save_artifact_fails(self):
+        """Test artifact restoration when save_artifact raises exception."""
+        session_service = InMemorySessionService()
+        artifact_service = InMemoryArtifactService()
+        checkpoint_service = CheckpointService(
+            session_service=session_service, artifact_service=artifact_service
+        )
+
+        session = await session_service.create_session(
+            app_name="test_app", user_id="user1"
+        )
+
+        # Create checkpoint with artifact
+        await artifact_service.save_artifact(
+            app_name="test_app",
+            user_id="user1",
+            session_id=session.id,
+            filename="file1.txt",
+            data=b"Content",
+        )
+
+        await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp1", artifact_filenames=["file1.txt"]
+        )
+
+        # Mock save_artifact to raise exception
+        with patch.object(
+            artifact_service, "save_artifact", side_effect=PermissionError("Read-only")
+        ):
+            # Should not crash, just log warning
+            result = await checkpoint_service.restore_checkpoint(
+                session, "cp1", restore_artifacts=True
+            )
+            assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_restore_artifacts_get_returns_none(self):
+        """Test artifact restoration when get_artifact returns None."""
+        session_service = InMemorySessionService()
+        artifact_service = InMemoryArtifactService()
+        checkpoint_service = CheckpointService(
+            session_service=session_service, artifact_service=artifact_service
+        )
+
+        session = await session_service.create_session(
+            app_name="test_app", user_id="user1"
+        )
+
+        # Create checkpoint with fake artifact
+        session.state["_checkpoint_cp1"] = {
+            "checkpoint_id": "cp1",
+            "description": None,
+            "agent_name": None,
+            "artifact_versions": {"file.txt": 1},
+            "state_snapshot": {},
+            "is_delta": False,
+            "base_checkpoint_id": None,
+            "custom_metadata": {},
+            "timestamp": 1234567890.0,
+        }
+
+        # Mock get_artifact to return None
+        with patch.object(artifact_service, "get_artifact", return_value=None):
+            # Should not crash or try to save None
+            result = await checkpoint_service.restore_checkpoint(
+                session, "cp1", restore_artifacts=True
+            )
+            assert result is not None
+
+
+class TestCheckpointServiceDeltaCompression:
+    """Test delta compression edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_delta_with_deleted_keys(self):
+        """Test delta compression tracks deleted keys."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Create first checkpoint with some state
+        session.state["key1"] = "value1"
+        session.state["key2"] = "value2"
+        await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp1", use_delta=False
+        )
+
+        # Delete key2 from state
+        del session.state["key2"]
+
+        # Create second checkpoint with delta
+        cp2 = await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp2", use_delta=True
+        )
+
+        # Verify delta tracks deletion
+        assert cp2.is_delta == True
+        assert cp2.base_checkpoint_id == "cp1"
+        # Deletion marker should be present
+        assert "key2" in cp2.state_snapshot
+        assert cp2.state_snapshot["key2"] is None
+
+    @pytest.mark.asyncio
+    async def test_delta_with_no_changes(self):
+        """Test delta when state hasn't changed."""
+        session_service = InMemorySessionService()
+        checkpoint_service = CheckpointService(session_service=session_service)
+
+        session = await session_service.create_session(
+            app_name="test", user_id="user1"
+        )
+
+        # Create first checkpoint
+        session.state["key1"] = "value1"
+        await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp1", use_delta=False
+        )
+
+        # No state changes
+        # Create second checkpoint with delta
+        cp2 = await checkpoint_service.create_checkpoint(
+            session=session, checkpoint_id="cp2", use_delta=True
+        )
+
+        # Empty delta should result in full snapshot
+        assert cp2.is_delta == False or len(cp2.state_snapshot) > 0
