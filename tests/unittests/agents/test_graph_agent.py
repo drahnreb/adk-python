@@ -43,6 +43,7 @@ from google.genai import types
 # Mock Agents for Testing
 # ============================================================================
 
+
 class MockAgent:
     """Mock agent that returns predetermined responses."""
 
@@ -58,8 +59,7 @@ class MockAgent:
         response = self.responses[min(self.call_count, len(self.responses) - 1)]
         self.call_count += 1
         yield Event(
-            author=self.name,
-            content=types.Content(parts=[types.Part(text=response)])
+            author=self.name, content=types.Content(parts=[types.Part(text=response)])
         )
 
 
@@ -70,7 +70,9 @@ class MockLlmAgent(LlmAgent):
     model_config = {"arbitrary_types_allowed": True, "extra": "allow"}
 
     def __init__(self, name: str, response: str = "mock response", **kwargs):
-        super().__init__(name=name, model="gemini-2.0-flash-exp", instruction="mock", **kwargs)
+        super().__init__(
+            name=name, model="gemini-2.0-flash-exp", instruction="mock", **kwargs
+        )
         # Store as model extra fields
         object.__setattr__(self, "_mock_response", response)
         object.__setattr__(self, "_mock_call_count", 0)
@@ -82,8 +84,7 @@ class MockLlmAgent(LlmAgent):
 
         response = object.__getattribute__(self, "_mock_response")
         yield Event(
-            author=self.name,
-            content=types.Content(parts=[types.Part(text=response)])
+            author=self.name, content=types.Content(parts=[types.Part(text=response)])
         )
 
     @property
@@ -95,6 +96,7 @@ class MockLlmAgent(LlmAgent):
 # ============================================================================
 # Test: Basic Graph Structure
 # ============================================================================
+
 
 class TestGraphStructure:
     """Test basic graph construction and structure."""
@@ -166,15 +168,14 @@ class TestGraphStructure:
 # Test: State Management and Reducers
 # ============================================================================
 
+
 class TestStateManagement:
     """Test state management and reducer strategies."""
 
     def test_overwrite_reducer(self):
         """Test OVERWRITE reducer replaces values."""
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            reducer=StateReducer.OVERWRITE
+            name="test", agent=MockLlmAgent("agent"), reducer=StateReducer.OVERWRITE
         )
 
         state = GraphState(data={"test": "old_value"})
@@ -185,9 +186,7 @@ class TestStateManagement:
     def test_append_reducer(self):
         """Test APPEND reducer appends to list."""
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            reducer=StateReducer.APPEND
+            name="test", agent=MockLlmAgent("agent"), reducer=StateReducer.APPEND
         )
 
         state = GraphState(data={"test": ["item1"]})
@@ -198,9 +197,7 @@ class TestStateManagement:
     def test_append_reducer_creates_list(self):
         """Test APPEND reducer creates list if key doesn't exist."""
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            reducer=StateReducer.APPEND
+            name="test", agent=MockLlmAgent("agent"), reducer=StateReducer.APPEND
         )
 
         state = GraphState(data={})
@@ -211,9 +208,7 @@ class TestStateManagement:
     def test_sum_reducer(self):
         """Test SUM reducer adds numeric values."""
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            reducer=StateReducer.SUM
+            name="test", agent=MockLlmAgent("agent"), reducer=StateReducer.SUM
         )
 
         state = GraphState(data={"test": 10})
@@ -223,6 +218,7 @@ class TestStateManagement:
 
     def test_custom_reducer(self):
         """Test CUSTOM reducer uses custom function."""
+
         def custom_fn(old_val, new_val):
             """Concatenate strings with separator."""
             if old_val is None:
@@ -233,7 +229,7 @@ class TestStateManagement:
             name="test",
             agent=MockLlmAgent("agent"),
             reducer=StateReducer.CUSTOM,
-            custom_reducer=custom_fn
+            custom_reducer=custom_fn,
         )
 
         state = GraphState(data={"test": "value1"})
@@ -244,9 +240,7 @@ class TestStateManagement:
     def test_state_immutability(self):
         """Test that output_mapper doesn't modify original state."""
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            reducer=StateReducer.OVERWRITE
+            name="test", agent=MockLlmAgent("agent"), reducer=StateReducer.OVERWRITE
         )
 
         original_state = GraphState(data={"test": "original"})
@@ -259,6 +253,7 @@ class TestStateManagement:
 # ============================================================================
 # Test: Conditional Routing
 # ============================================================================
+
 
 class TestConditionalRouting:
     """Test conditional edge routing."""
@@ -273,8 +268,7 @@ class TestConditionalRouting:
     def test_conditional_edge_true(self):
         """Test conditional edge routes when condition is true."""
         edge = EdgeCondition(
-            target_node="next",
-            condition=lambda s: s.data.get("value") > 10
+            target_node="next", condition=lambda s: s.data.get("value") > 10
         )
         state = GraphState(data={"value": 15})
 
@@ -283,8 +277,7 @@ class TestConditionalRouting:
     def test_conditional_edge_false(self):
         """Test conditional edge doesn't route when condition is false."""
         edge = EdgeCondition(
-            target_node="next",
-            condition=lambda s: s.data.get("value") > 10
+            target_node="next", condition=lambda s: s.data.get("value") > 10
         )
         state = GraphState(data={"value": 5})
 
@@ -311,6 +304,7 @@ class TestConditionalRouting:
 # Test: Cyclic Support and ReAct Pattern
 # ============================================================================
 
+
 @pytest.mark.asyncio
 class TestCyclicExecution:
     """Test cyclic graph execution (loops, ReAct pattern)."""
@@ -323,35 +317,46 @@ class TestCyclicExecution:
         counter_responses = [str(i) for i in range(1, 10)]
         counter_agent = MockAgent("counter", counter_responses)
 
-        graph.add_node(GraphNode(
-            name="counter",
-            agent=counter_agent,
-            output_mapper=lambda output, state: GraphState(
-                data={**state.data, "count": int(output)},
-                metadata=state.metadata
+        graph.add_node(
+            GraphNode(
+                name="counter",
+                agent=counter_agent,
+                output_mapper=lambda output, state: GraphState(
+                    data={**state.data, "count": int(output)}, metadata=state.metadata
+                ),
             )
-        ))
+        )
 
         # Loop back if count < 3
         graph.set_start("counter")
         graph.add_edge(
-            "counter",
-            "counter",
-            condition=lambda s: s.data.get("count", 0) < 3
+            "counter", "counter", condition=lambda s: s.data.get("count", 0) < 3
         )
         graph.set_end("counter")
 
         # Execute with Runner
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         iterations = 0
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="start")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="start")]),
+        ):
             if event.content and event.content.parts:
-                iterations = event.actions.state_delta.get("graph_iterations", 0) if event.actions and event.actions.state_delta else 0
+                iterations = (
+                    event.actions.state_delta.get("graph_iterations", 0)
+                    if event.actions and event.actions.state_delta
+                    else 0
+                )
 
         # Should run 3 iterations (count 1, 2, 3)
         assert iterations == 3
@@ -368,16 +373,28 @@ class TestCyclicExecution:
         graph.set_start("loop")
         graph.add_edge("loop", "loop")  # Always loop back
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         iterations = 0
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="start")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="start")]),
+        ):
             if event.content and event.content.parts:
-                iterations = event.actions.state_delta.get("graph_iterations", 0) if event.actions and event.actions.state_delta else 0
+                iterations = (
+                    event.actions.state_delta.get("graph_iterations", 0)
+                    if event.actions and event.actions.state_delta
+                    else 0
+                )
 
         # Should stop at max_iterations
         assert iterations == 3
@@ -403,21 +420,35 @@ class TestCyclicExecution:
         graph.add_edge(
             "observe",
             "reason",
-            condition=lambda s: "CONTINUE" in s.data.get("observe", "").upper()
+            condition=lambda s: "CONTINUE" in s.data.get("observe", "").upper(),
         )
         # When COMPLETE (or any other value), no edge matches, so execution stops at end node
         graph.set_end("observe")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         path = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test task")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(
+                role="user", parts=[types.Part(text="test task")]
+            ),
+        ):
             if event.content and event.content.parts:
-                path = event.actions.state_delta.get("graph_path", []) if event.actions and event.actions.state_delta else []
+                path = (
+                    event.actions.state_delta.get("graph_path", [])
+                    if event.actions and event.actions.state_delta
+                    else []
+                )
 
         # Should execute: reason -> act -> observe -> reason -> act -> observe
         expected = ["reason", "act", "observe", "reason", "act", "observe"]
@@ -428,134 +459,19 @@ class TestCyclicExecution:
 # Test: Human-in-the-Loop Interrupts
 # ============================================================================
 
-@pytest.mark.asyncio
-class TestInterrupts:
-    """Test human-in-the-loop interrupt capabilities."""
 
-    async def test_interrupt_before(self):
-        """Test interrupt before node execution."""
-        graph = GraphAgent(name="test")
-
-        agent = MockAgent("agent", ["response"])
-        graph.add_node(GraphNode(name="worker", agent=agent))
-        graph.set_start("worker")
-        graph.set_end("worker")
-
-        # Add interrupt before
-        graph.add_interrupt("worker", InterruptMode.BEFORE)
-
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
-
-        # Create session first
-        session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
-        interrupt_events = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
-            if event.content and event.content.parts and "Interrupt" in event.content.parts[0].text:
-                if "Interrupt before" in event.content.parts[0].text:
-                    interrupt_events.append(event)
-
-        assert len(interrupt_events) == 1
-        # Parse node name from interrupt message
-        interrupt_text = interrupt_events[0].content.parts[0].text
-        assert "worker" in interrupt_text
-
-    async def test_interrupt_after(self):
-        """Test interrupt after node execution."""
-        graph = GraphAgent(name="test")
-
-        agent = MockAgent("agent", ["response"])
-        graph.add_node(GraphNode(name="worker", agent=agent))
-        graph.set_start("worker")
-        graph.set_end("worker")
-
-        # Add interrupt after
-        graph.add_interrupt("worker", InterruptMode.AFTER)
-
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
-
-        # Create session first
-        session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
-        interrupt_events = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
-            if event.content and event.content.parts and "Interrupt" in event.content.parts[0].text:
-                if "Interrupt after" in event.content.parts[0].text:
-                    interrupt_events.append(event)
-
-        assert len(interrupt_events) == 1
-        # Parse node name from interrupt message
-        interrupt_text = interrupt_events[0].content.parts[0].text
-        assert "worker" in interrupt_text
-
-    async def test_interrupt_both(self):
-        """Test interrupt both before and after."""
-        graph = GraphAgent(name="test")
-
-        agent = MockAgent("agent", ["response"])
-        graph.add_node(GraphNode(name="worker", agent=agent))
-        graph.set_start("worker")
-        graph.set_end("worker")
-
-        # Add interrupt both
-        graph.add_interrupt("worker", InterruptMode.BOTH)
-
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
-
-        # Create session first
-        session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
-        before_count = 0
-        after_count = 0
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
-            if event.content and event.content.parts and "Interrupt" in event.content.parts[0].text:
-                if "Interrupt before" in event.content.parts[0].text:
-                    before_count += 1
-                elif "Interrupt after" in event.content.parts[0].text:
-                    after_count += 1
-
-        assert before_count == 1
-        assert after_count == 1
-
-    async def test_interrupt_contains_state(self):
-        """Test interrupt event contains current state."""
-        graph = GraphAgent(name="test")
-
-        agent = MockAgent("agent", ["response"])
-        graph.add_node(GraphNode(name="worker", agent=agent))
-        graph.set_start("worker")
-        graph.set_end("worker")
-        graph.add_interrupt("worker", InterruptMode.BEFORE)
-
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
-
-        # Create session first
-        session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
-        interrupt_event = None
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test input")])):
-            if event.content and event.content.parts and "Interrupt" in event.content.parts[0].text:
-                if "Interrupt before" in event.content.parts[0].text:
-                    # State is included in event.actions.state_delta (ADK-conformant)
-                    interrupt_event = event
-
-        # Verify interrupt was received and contains state information
-        assert interrupt_event is not None
-        assert "worker" in interrupt_event.content.parts[0].text
-        # Check state_delta contains interrupt metadata
-        assert interrupt_event.actions is not None
-        assert interrupt_event.actions.state_delta is not None
-        assert interrupt_event.actions.state_delta["interrupt_node"] == "worker"
-        assert "test input" in str(interrupt_event.actions.state_delta["interrupt_state"])
+# ============================================================================
+# Test: Observability
+# ============================================================================
+# NOTE: Tests for callback-based observability moved to test_graph_callbacks.py
+# The old hardcoded "→ Node:" and "✓ Completed:" events were intentionally
+# removed and replaced with callback-based observability per refactor requirements.
 
 
 # ============================================================================
 # Test: Checkpointing
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestCheckpointing:
@@ -574,16 +490,26 @@ class TestCheckpointing:
         graph.add_edge("node1", "node2")
         graph.set_end("node2")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         checkpoints = []
         last_checkpoint = None
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
-            session = await runner.session_service.get_session(app_name="test_graph", user_id="test_user", session_id="test")
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
+            session = await runner.session_service.get_session(
+                app_name="test_graph", user_id="test_user", session_id="test"
+            )
             if "graph_checkpoint" in session.state:
                 current_checkpoint = session.state["graph_checkpoint"]
                 # Only append if it's a new checkpoint (different node or iteration)
@@ -605,17 +531,27 @@ class TestCheckpointing:
         graph.set_start("worker")
         graph.set_end("worker")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             pass
 
         # Check saved state
-        session = await runner.session_service.get_session(app_name="test_graph", user_id="test_user", session_id="test")
+        session = await runner.session_service.get_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
         assert "graph_state" in session.state
         graph_state = session.state["graph_state"]
         assert graph_state["data"]["worker"] == "response"
@@ -624,6 +560,7 @@ class TestCheckpointing:
 # ============================================================================
 # Test: Agent Type Support (LLM, Sequential, Parallel, Graph)
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestAgentTypeSupport:
@@ -638,16 +575,28 @@ class TestAgentTypeSupport:
         graph.set_start("llm")
         graph.set_end("llm")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         final_output = None
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             if event.content and event.content.parts:
-                final_output = event.content.parts[0].text if event.content and event.content.parts else ""
+                final_output = (
+                    event.content.parts[0].text
+                    if event.content and event.content.parts
+                    else ""
+                )
 
         assert "llm response" in str(final_output)
         assert llm_agent.call_count == 1
@@ -664,22 +613,38 @@ class TestAgentTypeSupport:
         graph.set_start("custom")
         graph.set_end("custom")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
 
         # Create session first
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-        
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
+
         final_output = None
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test input")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(
+                role="user", parts=[types.Part(text="test input")]
+            ),
+        ):
             if event.content and event.content.parts:
-                final_output = event.content.parts[0].text if event.content and event.content.parts else ""
+                final_output = (
+                    event.content.parts[0].text
+                    if event.content and event.content.parts
+                    else ""
+                )
 
         assert "processed: test input" in str(final_output)
 
     def test_node_requires_agent_or_function(self):
         """Test that node requires either agent or function."""
-        with pytest.raises(ValueError, match="Either agent or function must be provided"):
+        with pytest.raises(
+            ValueError, match="Either agent or function must be provided"
+        ):
             GraphNode(name="invalid", agent=None, function=None)
 
 
@@ -687,18 +652,18 @@ class TestAgentTypeSupport:
 # Test: Input/Output Mappers
 # ============================================================================
 
+
 class TestMappers:
     """Test input and output mappers."""
 
     def test_custom_input_mapper(self):
         """Test custom input mapper transforms state to agent input."""
+
         def input_mapper(state: GraphState) -> str:
             return f"Custom: {state.data.get('value', '')}"
 
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            input_mapper=input_mapper
+            name="test", agent=MockLlmAgent("agent"), input_mapper=input_mapper
         )
 
         state = GraphState(data={"value": "test"})
@@ -708,17 +673,15 @@ class TestMappers:
 
     def test_custom_output_mapper(self):
         """Test custom output mapper transforms agent output to state."""
+
         def output_mapper(output: str, state: GraphState) -> GraphState:
             new_state = GraphState(
-                data={**state.data, "result": output.upper()},
-                metadata=state.metadata
+                data={**state.data, "result": output.upper()}, metadata=state.metadata
             )
             return new_state
 
         node = GraphNode(
-            name="test",
-            agent=MockLlmAgent("agent"),
-            output_mapper=output_mapper
+            name="test", agent=MockLlmAgent("agent"), output_mapper=output_mapper
         )
 
         state = GraphState(data={})
@@ -730,6 +693,7 @@ class TestMappers:
 # ============================================================================
 # Test: Error Handling
 # ============================================================================
+
 
 class TestErrorHandling:
     """Test error handling and validation."""
@@ -749,13 +713,6 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="Source node invalid not found"):
             graph.add_edge("invalid", "node1")
 
-    def test_add_interrupt_invalid_node(self):
-        """Test add_interrupt raises error for non-existent node."""
-        graph = GraphAgent(name="test")
-
-        with pytest.raises(ValueError, match="Node invalid not found"):
-            graph.add_interrupt("invalid", InterruptMode.BEFORE)
-
     @pytest.mark.asyncio
     async def test_node_no_edges_not_end_raises_error(self):
         """Test execution raises error when node has no edges and is not an end node."""
@@ -766,12 +723,22 @@ class TestErrorHandling:
         graph.set_start("node1")
         # Don't set as end node and don't add edges
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
-        with pytest.raises(ValueError, match="has no outgoing edges and is not an end node"):
-            async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        with pytest.raises(
+            ValueError, match="has no outgoing edges and is not an end node"
+        ):
+            async for event in runner.run_async(
+                user_id="test_user",
+                session_id="test",
+                new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+            ):
                 pass
 
     @pytest.mark.asyncio
@@ -783,18 +750,27 @@ class TestErrorHandling:
         graph.add_node(GraphNode(name="node1", agent=agent))
         # Don't set start node
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         with pytest.raises(ValueError, match="Start node not set"):
-            async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+            async for event in runner.run_async(
+                user_id="test_user",
+                session_id="test",
+                new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+            ):
                 pass
 
 
 # ============================================================================
 # Test: Function Execution
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestFunctionExecution:
@@ -812,12 +788,20 @@ class TestFunctionExecution:
         graph.set_start("sync_node")
         graph.set_end("sync_node")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         final_output = None
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             if event.content and event.content.parts:
                 final_output = event.content.parts[0].text
 
@@ -827,6 +811,7 @@ class TestFunctionExecution:
 # ============================================================================
 # Test: State Restoration
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestStateRestoration:
@@ -841,26 +826,41 @@ class TestStateRestoration:
         graph.set_start("node1")
         graph.set_end("node1")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         # First run - create state
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="first")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="first")]),
+        ):
             pass
 
         # Second run - should restore state
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="second")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="second")]),
+        ):
             pass
 
         # Verify state was persisted
-        session = await session_service.get_session(app_name="test_graph", user_id="test_user", session_id="test")
+        session = await session_service.get_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
         assert "graph_state" in session.state
 
 
 # ============================================================================
 # Test: Example Functions (Smoke Tests)
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestExamples:
@@ -869,12 +869,14 @@ class TestExamples:
     async def test_example_react_pattern_imports(self):
         """Test that example_react_pattern can be imported and called."""
         from google.adk.agents.graph.graph_agent import example_react_pattern
+
         # Just verify the function exists and is async
         assert asyncio.iscoroutinefunction(example_react_pattern)
 
     async def test_example_multi_agent_graph_imports(self):
         """Test that example_multi_agent_graph can be imported and called."""
         from google.adk.agents.graph.graph_agent import example_multi_agent_graph
+
         # Just verify the function exists and is async
         assert asyncio.iscoroutinefunction(example_multi_agent_graph)
 
@@ -882,6 +884,7 @@ class TestExamples:
 # ============================================================================
 # Test: ADK Conformity
 # ============================================================================
+
 
 @pytest.mark.asyncio
 class TestADKConformity:
@@ -896,26 +899,34 @@ class TestADKConformity:
         graph.set_start("node1")
         graph.set_end("node1")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         # Collect all events
         events = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             events.append(event)
 
         # Verify all events are proper Event objects
         assert len(events) > 0
         for event in events:
             # Must have author field
-            assert hasattr(event, 'author')
+            assert hasattr(event, "author")
             assert event.author is not None
 
             # Should have content (some events might not)
             if event.content:
                 assert isinstance(event.content, types.Content)
-                assert hasattr(event.content, 'parts')
+                assert hasattr(event.content, "parts")
 
             # May have actions (EventActions)
             if event.actions:
@@ -928,22 +939,30 @@ class TestADKConformity:
         # Custom function that verifies InvocationContext structure
         def verify_ctx(state: GraphState, ctx):
             # Verify required InvocationContext fields
-            assert hasattr(ctx, 'session')
-            assert hasattr(ctx, 'invocation_id')
-            assert hasattr(ctx, 'agent')
-            assert hasattr(ctx, 'session_service')
+            assert hasattr(ctx, "session")
+            assert hasattr(ctx, "invocation_id")
+            assert hasattr(ctx, "agent")
+            assert hasattr(ctx, "session_service")
             return "context valid"
 
         graph.add_node(GraphNode(name="node1", function=verify_ctx))
         graph.set_start("node1")
         graph.set_end("node1")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         # If this doesn't raise, context is valid
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             pass
 
     async def test_state_delta_conformity(self):
@@ -955,13 +974,21 @@ class TestADKConformity:
         graph.set_start("node1")
         graph.set_end("node1")
 
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
+        runner = Runner(
+            app_name="test_graph", agent=graph, session_service=InMemorySessionService()
+        )
         session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
+        await session_service.create_session(
+            app_name="test_graph", user_id="test_user", session_id="test"
+        )
 
         # Collect events with state_delta
         state_delta_events = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
+        async for event in runner.run_async(
+            user_id="test_user",
+            session_id="test",
+            new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+        ):
             if event.actions and event.actions.state_delta:
                 state_delta_events.append(event)
 
@@ -972,39 +999,14 @@ class TestADKConformity:
         for event in state_delta_events:
             assert isinstance(event.actions.state_delta, dict)
 
-    async def test_escalate_flag_conformity(self):
-        """Test that interrupts use EventActions.escalate properly."""
-        graph = GraphAgent(name="test")
-
-        agent = MockAgent("agent", ["response"])
-        graph.add_node(GraphNode(name="node1", agent=agent))
-        graph.set_start("node1")
-        graph.set_end("node1")
-        graph.add_interrupt("node1", InterruptMode.BEFORE)
-
-        runner = Runner(app_name="test_graph", agent=graph, session_service=InMemorySessionService())
-        session_service = runner.session_service
-        await session_service.create_session(app_name="test_graph", user_id="test_user", session_id="test")
-
-        # Collect interrupt events
-        interrupt_events = []
-        async for event in runner.run_async(user_id="test_user", session_id="test", new_message=types.Content(role="user", parts=[types.Part(text="test")])):
-            if event.content and event.content.parts and "Interrupt" in event.content.parts[0].text:
-                interrupt_events.append(event)
-
-        assert len(interrupt_events) > 0
-
-        # Verify escalate flag is present
-        for event in interrupt_events:
-            assert event.actions is not None
-            assert hasattr(event.actions, 'escalate')
-            assert isinstance(event.actions.escalate, bool)
-
+    # NOTE: test_escalate_flag_conformity removed - tested hardcoded events that were removed
+    # Callback-based observability (the replacement) is tested in test_graph_callbacks.py
 
 
 # ============================================================================
 # Graph Export Tests
 # ============================================================================
+
 
 class TestGraphExport:
     """Tests for D3-compatible graph structure export."""
@@ -1100,23 +1102,6 @@ class TestGraphExport:
         nodes = {n["id"]: n for n in structure["nodes"]}
         assert nodes["func"]["type"] == "function"
         assert nodes["agent"]["type"] == "agent"
-
-    def test_export_with_interrupts(self):
-        """Test export includes interrupt metadata."""
-        graph = GraphAgent(name="test")
-
-        graph.add_node(GraphNode(name="a", function=lambda s, c: "a"))
-        graph.add_node(GraphNode(name="b", function=lambda s, c: "b"))
-
-        graph.add_interrupt("a", InterruptMode.BEFORE)
-        graph.add_interrupt("b", InterruptMode.AFTER)
-
-        structure = graph.export_graph_structure()
-
-        # Verify interrupt metadata
-        metadata = structure["metadata"]
-        assert "a" in metadata["interrupt_before"]
-        assert "b" in metadata["interrupt_after"]
 
     def test_export_empty_graph(self):
         """Test export of empty graph."""
