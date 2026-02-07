@@ -428,6 +428,7 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                     logger.info(
                         f"GraphAgent execution cancelled (immediate interrupt) for session {ctx.session.id}"
                     )
+                    # Save partial state before cancelling (enables resume/restart)
                     yield Event(
                         author=self.name,
                         content=types.Content(
@@ -437,11 +438,15 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                             escalate=False,
                             state_delta={
                                 "graph_cancelled": True,
+                                "graph_cancelled_at_node": current_node_name,
                                 "graph_iteration": iteration,
+                                "graph_state": state.model_dump(),  # Save partial state
+                                "graph_path": state.metadata.get("path", []),
+                                "graph_can_resume": True,  # Flag that resume is possible
                             },
                         ),
                     )
-                    break  # Exit immediately
+                    break  # Exit immediately but state is saved
 
                 # Track execution path
                 state.metadata["path"].append(current_node_name)
@@ -552,6 +557,9 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                             logger.info(
                                 f"GraphAgent execution cancelled (immediate interrupt during node '{current_node_name}') for session {ctx.session.id}"
                             )
+                            # Save partial state before cancelling (enables resume/restart)
+                            # Include partial output from node execution
+                            partial_output = state.metadata.get("_last_output", "")
                             yield Event(
                                 author=self.name,
                                 content=types.Content(
@@ -567,16 +575,22 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                                         "graph_cancelled": True,
                                         "graph_cancelled_at_node": current_node_name,
                                         "graph_iteration": iteration,
+                                        "graph_state": state.model_dump(),  # Save partial state
+                                        "graph_path": state.metadata.get("path", []),
+                                        "graph_partial_output": partial_output,  # Partial node output
+                                        "graph_can_resume": True,  # Flag that resume is possible
                                     },
                                 ),
                             )
-                            return  # Exit immediately without continuing
+                            return  # Exit immediately but state is saved
                         yield event
                 except asyncio.CancelledError:
                     # Task cancelled externally (e.g., timeout, user abort)
                     logger.info(
                         f"GraphAgent task cancelled during node '{current_node_name}' for session {ctx.session.id}"
                     )
+                    # Save partial state before re-raising (enables resume/restart)
+                    partial_output = state.metadata.get("_last_output", "")
                     yield Event(
                         author=self.name,
                         content=types.Content(
@@ -591,6 +605,11 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                             state_delta={
                                 "graph_task_cancelled": True,
                                 "graph_cancelled_at_node": current_node_name,
+                                "graph_iteration": iteration,
+                                "graph_state": state.model_dump(),  # Save partial state
+                                "graph_path": state.metadata.get("path", []),
+                                "graph_partial_output": partial_output,
+                                "graph_can_resume": True,
                             },
                         ),
                     )

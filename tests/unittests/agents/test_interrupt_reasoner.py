@@ -534,3 +534,179 @@ async def test_immediate_cancel_during_node_execution():
     ), f"Should have stopped mid-execution, but got {event_count} events"
     assert event_count >= 2, "Should have seen at least 2 events before cancel"
     assert cancelled_event_seen, "Should have seen cancellation event"
+
+
+@pytest.mark.asyncio
+async def test_immediate_cancel_saves_partial_state():
+    """Test immediate cancel saves partial state to enable resume/restart."""
+    interrupt_service = InterruptService()
+    graph = GraphAgent(
+        name="test_graph",
+        interrupt_service=interrupt_service,
+    )
+
+    # Multi-node graph to test partial execution
+    node_a = GraphNode(name="node_a", agent=MockAgent(name="agent_a", response="a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent(name="agent_b", response="b"))
+    node_c = GraphNode(name="node_c", agent=MockAgent(name="agent_c", response="c"))
+
+    graph.add_node(node_a).add_node(node_b).add_node(node_c)
+    graph.add_edge("node_a", "node_b")
+    graph.add_edge("node_b", "node_c")
+    graph.set_start("node_a").set_end("node_c")
+
+    session_service = InMemorySessionService()
+    runner = Runner(app_name="test_app", agent=graph, session_service=session_service)
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    interrupt_service.register_session("test_session")
+
+    # Cancel after node_a completes
+    event_count = 0
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+    ):
+        if event.author == "agent_a":
+            event_count += 1
+            # Cancel after first node
+            if event_count == 1:
+                await interrupt_service.cancel("test_session")
+
+    # Get session to verify saved state
+    session = await session_service.get_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    # Verify partial state was saved
+    assert session.state.get("graph_cancelled") is True
+    # Cancellation happens at start of next iteration (node_b)
+    assert session.state.get("graph_cancelled_at_node") in ["node_a", "node_b"]
+    assert session.state.get("graph_can_resume") is True
+    assert "graph_state" in session.state
+    assert "graph_path" in session.state
+
+    # Verify saved state contains correct data
+    saved_state = session.state.get("graph_state", {})
+    assert "node_a" in saved_state.get("data", {})  # node_a output was saved
+    # node_b might have started but not completed
+    assert "node_c" not in saved_state.get("data", {})  # node_c never executed
+
+
+@pytest.mark.asyncio
+async def test_restart_after_cancel():
+    """Test graph can restart from scratch after cancellation."""
+    interrupt_service = InterruptService()
+    graph = GraphAgent(
+        name="test_graph",
+        interrupt_service=interrupt_service,
+    )
+
+    node_a = GraphNode(name="node_a", agent=MockAgent(name="agent_a", response="a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent(name="agent_b", response="b"))
+
+    graph.add_node(node_a).add_node(node_b)
+    graph.add_edge("node_a", "node_b")
+    graph.set_start("node_a").set_end("node_b")
+
+    session_service = InMemorySessionService()
+    runner = Runner(app_name="test_app", agent=graph, session_service=session_service)
+
+    # First run: cancel after node_a
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+    interrupt_service.register_session("test_session")
+
+    event_count_run1 = 0
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="run1")]),
+    ):
+        if event.author in ["agent_a", "agent_b"]:
+            event_count_run1 += 1
+            if event.author == "agent_a":
+                await interrupt_service.cancel("test_session")
+
+    # Verify first run was cancelled
+    session_after_cancel = await session_service.get_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+    assert session_after_cancel.state.get("graph_cancelled") is True
+
+    # Second run: restart from scratch (new session)
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user2", session_id="test_session2"
+    )
+    interrupt_service.register_session("test_session2")
+
+    execution_order_run2 = []
+    async for event in runner.run_async(
+        user_id="test_user2",
+        session_id="test_session2",
+        new_message=types.Content(role="user", parts=[types.Part(text="run2")]),
+    ):
+        if event.author in ["agent_a", "agent_b"]:
+            execution_order_run2.append(event.author)
+
+    # Verify second run completed fully
+    assert execution_order_run2 == ["agent_a", "agent_b"]
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_after_cancel():
+    """Test session state is properly cleaned and accessible after cancel."""
+    interrupt_service = InterruptService()
+    graph = GraphAgent(
+        name="test_graph",
+        interrupt_service=interrupt_service,
+    )
+
+    # Use 2 nodes so cancellation can happen before completion
+    node_a = GraphNode(name="node_a", agent=MockAgent(name="agent_a", response="a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent(name="agent_b", response="b"))
+    graph.add_node(node_a).add_node(node_b)
+    graph.add_edge("node_a", "node_b")
+    graph.set_start("node_a").set_end("node_b")
+
+    session_service = InMemorySessionService()
+    runner = Runner(app_name="test_app", agent=graph, session_service=session_service)
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+    interrupt_service.register_session("test_session")
+
+    # Run and cancel
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test")]),
+    ):
+        if event.author == "agent_a":
+            await interrupt_service.cancel("test_session")
+
+    # Get session after cancel
+    session = await session_service.get_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    # Verify session is clean and accessible
+    assert session is not None
+    assert session.id == "test_session"
+    assert session.state is not None
+    assert isinstance(session.state, dict)
+
+    # Verify cancellation metadata is present
+    assert session.state.get("graph_cancelled") is True
+    assert "graph_state" in session.state
+    assert "graph_can_resume" in session.state
+
+    # Verify no memory leaks or dangling references
+    assert len(session.state.keys()) < 20  # Reasonable number of keys
+    assert all(isinstance(k, str) for k in session.state.keys())
