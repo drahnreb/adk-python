@@ -511,15 +511,17 @@ if evicted > 0:
 
 ## Future Enhancements
 
-**Potential improvements** (not currently planned):
+**Potential improvements** for distributed/production deployments (not currently planned):
 
-1. **Persistent State**: Store session state in database for crash recovery
+1. **Persistent State**: Store session state in database for crash recovery (currently in-memory)
 2. **Distributed Mode**: Redis-backed queues for multi-process deployments
 3. **Priority Queues**: High/low priority messages
 4. **Message Expiration**: TTL for queued messages
-5. **Batch Operations**: Bulk pause/resume/cancel
+5. **Batch Operations**: Bulk pause/resume/cancel across multiple sessions
 6. **Webhooks**: HTTP callbacks on state changes
-7. **Admin API**: REST API for session management
+7. **Admin API**: REST API for session management and monitoring
+
+**Note**: Core interrupt functionality (LLM reasoning, flexible timings, immediate cancellation, state preservation) is fully implemented.
 
 ---
 

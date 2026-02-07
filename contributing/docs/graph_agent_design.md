@@ -249,7 +249,33 @@ GraphAgent includes:
 
 ---
 
-## Limitations and Future Work
+## Implemented Features
+
+### Interrupt & Observability Framework ✅
+
+**Callback-based Observability**:
+- `before_node_callback` / `after_node_callback` for custom observability
+- `NodeCallbackContext` with full access to state, iteration, and invocation context
+- Developers control event format and content (no hardcoded strings)
+- Extensible metadata via `state_delta`
+
+**LLM-based Interrupt Reasoning**:
+- `InterruptReasoner` agent analyzes interrupt messages and decides actions
+- Context-aware decisions based on current node, state, and execution path
+- Available actions: continue, rerun, pause, defer, skip
+- Extensible via `custom_actions` dictionary
+
+**Flexible Interrupt Timings**:
+- `InterruptMode.BEFORE` - Validate before node execution
+- `InterruptMode.AFTER` - Correct after node execution (default)
+- `InterruptMode.BOTH` - Both before and after
+- Per-node configuration via `InterruptConfig.nodes`
+
+**Immediate Cancellation**:
+- ESC-like immediate interrupt (cancels during node execution, not just between nodes)
+- State preservation on cancellation (partial results, execution path, resume flag)
+- Clean session cleanup with restart capability
+- Three cancellation paths: between nodes, during execution, task cancellation
 
 ### Current Limitations
 
@@ -262,16 +288,12 @@ GraphAgent includes:
 3. **Checkpoint management coupled to GraphAgent**
    - **Future**: Extract CheckpointUtils for all agents
 
-4. **HITL not fully implemented**: `escalate=False` (notification only)
-   - **Future**: Integrate with Runner-level HITL handling
-
-### Planned Enhancements
+### Future Enhancements
 
 - Extract checkpointing to reusable utilities
-- Add parallel node execution
-- Enhance conditional routing (edge priorities)
-- Full HITL integration
-- D3 visualization improvements
+- Add parallel node execution with dependency management
+- Enhance conditional routing (edge priorities, weights)
+- D3 visualization improvements (show interrupt points, callback hooks)
 
 ---
 
