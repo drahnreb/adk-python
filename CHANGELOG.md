@@ -84,6 +84,25 @@
 
 
 
+## [Unreleased]
+
+### Features
+
+* **[GraphAgent]**
+  * Add comprehensive InterruptService enhancements for production use
+    * **Observability**: Added `interrupt_queue_depth_gauge` metric for monitoring session queue sizes in real-time ([d3403346](https://github.com/google/adk-python/commit/d3403346)).
+    * **Security Hardening**: Implemented input validation for session IDs (alphanumeric with hyphens/underscores), message content (10KB limit), metadata (100KB limit with JSON serializability check), and action types (configurable allowlist) ([ffe9727a](https://github.com/google/adk-python/commit/ffe9727a)).
+    * **UX Improvements**: Added async context manager (`session()`) for automatic session lifecycle management with exception-safe cleanup. Added 5 convenience methods: `pause_and_send()` (combine pause + send), `is_active()` (check session status), `clear_queue()` (clear messages without cancelling), `has_queued_messages()` (boolean check), `get_queue_depth()` (integer queue size). Enhanced all error messages with diagnostic context and actionable suggestions ([39220193](https://github.com/google/adk-python/commit/39220193)).
+    * **Scale Preparation**: Implemented session eviction policies with time-based (configurable `session_inactive_timeout`, default 1 hour) and LRU eviction (`max_sessions` limit with automatic eviction). Added activity tracking across all operations (pause, resume, send_message, check_interrupt). Added session management methods: `evict_inactive_sessions()`, `evict_oldest_sessions()`, `get_active_session_count()`, `list_active_sessions()` ([c01badd0](https://github.com/google/adk-python/commit/c01badd0)).
+    * **Documentation**: Added comprehensive architecture documentation (`contributing/docs/interrupt_service_architecture.md`) with system diagrams, component details, security features, performance characteristics, testing strategy, and production deployment best practices.
+    * Test coverage increased to 97% (96 total tests, exceeds 95% target).
+
+### Bug Fixes
+
+* **[GraphAgent]**
+  * Restore original InterruptService docstring with GraphAgent integration example and cancel() method reference ([80bab9d7](https://github.com/google/adk-python/commit/80bab9d7)).
+
+
 ## [1.22.1](https://github.com/google/adk-python/compare/v1.22.0...v1.22.1) (2026-01-09)
 
 ### Bug Fixes
