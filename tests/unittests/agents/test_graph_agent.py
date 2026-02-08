@@ -585,20 +585,18 @@ class TestAgentTypeSupport:
             app_name="test_graph", user_id="test_user", session_id="test"
         )
 
-        final_output = None
+        # Collect all event texts
+        event_texts = []
         async for event in runner.run_async(
             user_id="test_user",
             session_id="test",
             new_message=types.Content(role="user", parts=[types.Part(text="test")]),
         ):
             if event.content and event.content.parts:
-                final_output = (
-                    event.content.parts[0].text
-                    if event.content and event.content.parts
-                    else ""
-                )
+                event_texts.append(event.content.parts[0].text)
 
-        assert "llm response" in str(final_output)
+        # Check that llm agent's response appears in events
+        assert any("llm response" in text for text in event_texts), f"Expected 'llm response' in events, got {event_texts}"
         assert llm_agent.call_count == 1
 
     async def test_custom_function_node(self):

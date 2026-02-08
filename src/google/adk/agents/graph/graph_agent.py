@@ -49,25 +49,40 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any
+from typing import AsyncGenerator
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
 
 from google.genai import types
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict
+from pydantic import Field
 from typing_extensions import override
 
 from ...events.event import Event
 from ...events.event_actions import EventActions
+from ...telemetry.tracing import tracer
 from ...utils.feature_decorator import experimental
 from ..base_agent import BaseAgent
 from ..invocation_context import InvocationContext
 from ..llm_agent import LlmAgent
-from .callbacks import EdgeCallback, NodeCallback
+from .callbacks import EdgeCallback
+from .callbacks import NodeCallback
 from .graph_edge import EdgeCondition
 from .graph_node import GraphNode
-from .graph_state import GraphState, StateReducer
-from .interrupt import InterruptAction, InterruptConfig, InterruptMode
+from .graph_state import GraphState
+from .graph_state import StateReducer
+from .interrupt import InterruptAction
+from .interrupt import InterruptConfig
+from .interrupt import InterruptMode
 from .interrupt_reasoner import InterruptReasoner
-from .interrupt_service import InterruptMessage, InterruptService
+from .interrupt_service import InterruptMessage
+from .interrupt_service import InterruptService
+from .parallel import execute_parallel_group
+from .parallel import ParallelNodeGroup
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -128,6 +143,10 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
     end_nodes: List[str] = Field(default_factory=list)
     max_iterations: int = 50  # Prevent infinite loops
     checkpointing: bool = False
+    parallel_groups: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Parallel node groups for concurrent execution",
+    )
     interrupt_service: Optional[InterruptService] = Field(
         default=None,
         description="Optional InterruptService for dynamic runtime interrupts",
@@ -187,6 +206,7 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         self.after_node_callback = after_node_callback
         self.on_edge_condition_callback = on_edge_condition_callback
         self.checkpointing = checkpointing
+        # parallel_groups initialized by Field default_factory
 
     def add_node(self, node: GraphNode) -> "GraphAgent":
         """Add a node to the graph.
@@ -262,6 +282,55 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         self.nodes[from_node].add_edge(to_node, condition)
         return self
 
+    def add_parallel_group(
+        self,
+        group_id: str,
+        group: "ParallelNodeGroup",
+    ) -> "GraphAgent":
+        """Add a parallel node group for concurrent execution.
+
+        Args:
+            group_id: Unique identifier for the group
+            group: ParallelNodeGroup configuration
+
+        Returns:
+            Self for chaining
+
+        Raises:
+            ValueError: If nodes in group not found
+
+        Example:
+            >>> from google.adk.agents.graph import ParallelNodeGroup, JoinStrategy
+            >>> graph.add_parallel_group(
+            ...     "fetch_group",
+            ...     ParallelNodeGroup(
+            ...         nodes=["fetch_user", "fetch_products"],
+            ...         join_strategy=JoinStrategy.WAIT_ALL
+            ...     )
+            ... )
+        """
+        # Validate all nodes exist
+        for node_name in group.nodes:
+            if node_name not in self.nodes:
+                raise ValueError(f"Node {node_name} not found in graph")
+
+        self.parallel_groups[group_id] = group
+        return self
+
+    def _find_parallel_group(self, node_name: str) -> Optional[Tuple[str, Any]]:
+        """Find if a node is part of a parallel group.
+
+        Args:
+            node_name: Node name to check
+
+        Returns:
+            Tuple of (group_id, ParallelNodeGroup) if found, None otherwise
+        """
+        for group_id, group in self.parallel_groups.items():
+            if node_name in group.nodes:
+                return (group_id, group)
+        return None
+
     def export_graph_structure(self) -> Dict[str, Any]:
         """Export graph structure in D3-compatible JSON format.
 
@@ -318,7 +387,95 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
             "max_iterations": self.max_iterations,
         }
 
-        return {"nodes": nodes, "links": links, "metadata": metadata, "directed": True}
+        return {
+            "nodes": nodes,
+            "links": links,
+            "metadata": metadata,
+            "directed": True,
+        }
+
+    async def rewind_to_node(
+        self,
+        session_service: Any,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        node_name: str,
+        invocation_index: int = -1,
+    ) -> None:
+        """Rewind graph execution to before a specific node execution.
+
+        This method tightly integrates GraphAgent with ADK's rewind feature,
+        enabling temporal navigation within graph workflows. You can rewind
+        to any previously executed node, which is especially useful for:
+        - Retrying failed nodes with different inputs
+        - Exploring alternative execution paths
+        - Debugging workflow issues
+        - Handling loops (selecting specific iteration)
+
+        Args:
+            session_service: Session service instance
+            app_name: Application name
+            user_id: User ID
+            session_id: Session ID
+            node_name: Node to rewind to
+            invocation_index: Which invocation of the node (-1 for most recent)
+
+        Raises:
+            ValueError: If node has not been executed yet
+            ValueError: If invocation_index is out of range
+
+        Example:
+            >>> # Execute graph
+            >>> async for event in runner.run_async(user_id="u1", session_id="s1"):
+            ...     pass
+            >>>
+            >>> # Rewind to specific node
+            >>> await graph.rewind_to_node(
+            ...     session_service, "app", "u1", "s1", "validate"
+            ... )
+            >>>
+            >>> # Or rewind to specific invocation in a loop
+            >>> await graph.rewind_to_node(
+            ...     session_service, "app", "u1", "s1", "process", invocation_index=1
+            ... )
+        """
+        # Get session
+        session = await session_service.get_session(
+            app_name=app_name, user_id=user_id, session_id=session_id
+        )
+        if not session:
+            raise ValueError(f"Session not found: {session_id}")
+
+        # Get invocation IDs for the node
+        node_invocations = session.state.get("node_invocations", {}).get(node_name, [])
+        if not node_invocations:
+            raise ValueError(
+                f"Node '{node_name}' has not been executed yet. Available nodes:"
+                f" {list(session.state.get('node_invocations', {}).keys())}"
+            )
+
+        # Validate invocation index
+        if invocation_index < -len(node_invocations) or invocation_index >= len(
+            node_invocations
+        ):
+            raise ValueError(
+                f"Invocation index {invocation_index} out of range. "
+                f"Node '{node_name}' has {len(node_invocations)} invocations."
+            )
+
+        # Get the invocation ID to rewind to
+        invocation_id = node_invocations[invocation_index]
+
+        # Use Runner.rewind_async to perform the rewind
+        from ...runners import Runner
+
+        runner = Runner(app_name=app_name, agent=self, session_service=session_service)
+        await runner.rewind_async(
+            user_id=user_id,
+            session_id=session_id,
+            rewind_before_invocation_id=invocation_id,
+        )
 
     async def _execute_node(  # type: ignore[no-untyped-def]
         self, node: GraphNode, state: GraphState, ctx: InvocationContext
@@ -389,401 +546,556 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         if self.interrupt_service:
             self.interrupt_service.register_session(ctx.session.id)
 
-        try:
-            # Initialize state from session or create new
-            state_dict = ctx.session.state.get("graph_state")
-            if state_dict is None:
-                # Extract text from Content object (ADK 1.22.1)
-                user_text = ""
-                if (
-                    hasattr(ctx, "user_content")
-                    and ctx.user_content
-                    and ctx.user_content.parts
-                ):
-                    user_text = (
-                        ctx.user_content.parts[0].text
-                        if ctx.user_content.parts[0].text
-                        else ""
-                    )
-
-                state = GraphState(
-                    data={"input": user_text}, metadata={"iteration": 0, "path": []}
-                )
-            else:
-                # Restore GraphState from dict
-                state = GraphState(**state_dict)
-
-            current_node_name = self.start_node
-            iteration = 0
-
-            while current_node_name and iteration < self.max_iterations:
-                iteration += 1
-                current_node = self.nodes[current_node_name]
-
-                # Check for immediate cancellation (ESC-like interrupt)
-                # Allows user to abort execution at any time, not just at pause points
-                if self.interrupt_service and not self.interrupt_service.is_active(
-                    ctx.session.id
-                ):
-                    logger.info(
-                        f"GraphAgent execution cancelled (immediate interrupt) for session {ctx.session.id}"
-                    )
-                    # Save partial state before cancelling (enables resume/restart)
-                    yield Event(
-                        author=self.name,
-                        content=types.Content(
-                            parts=[types.Part(text="⚠️ Execution cancelled by user")]
-                        ),
-                        actions=EventActions(
-                            escalate=False,
-                            state_delta={
-                                "graph_cancelled": True,
-                                "graph_cancelled_at_node": current_node_name,
-                                "graph_iteration": iteration,
-                                "graph_state": state.model_dump(),  # Save partial state
-                                "graph_path": state.metadata.get("path", []),
-                                "graph_can_resume": True,  # Flag that resume is possible
-                            },
-                        ),
-                    )
-                    break  # Exit immediately but state is saved
-
-                # Track execution path
-                state.metadata["path"].append(current_node_name)
-                state.metadata["iteration"] = iteration
-
-                # Track agent path for nested graph support
-                agent_path = ctx.session.state.get("_agent_path", [])
-                agent_path_copy = agent_path.copy()
-                agent_path_copy.append(self.name)
-                ctx.session.state["_agent_path"] = agent_path_copy
-
-                # Update session state for interrupt tracking
-                ctx.session.state["graph_node"] = current_node_name
-                ctx.session.state["graph_iteration"] = iteration
-
-                # Invoke before_node_callback (custom observability)
-                if self.before_node_callback:
-                    from .callbacks import NodeCallbackContext
-
-                    callback_ctx = NodeCallbackContext(
-                        node=current_node,
-                        state=state,
-                        iteration=iteration,
-                        invocation_context=ctx,
-                        metadata={},
-                    )
-                    event = await self.before_node_callback(callback_ctx)
-                    if event:
-                        yield event
-
-                # Check for BEFORE-node interrupt (validation timing)
-                if (
-                    self._should_interrupt_before(current_node_name)
-                    and self.interrupt_service
-                ):
-                    interrupt_message = await self.interrupt_service.check_interrupt(
-                        ctx.session.id
-                    )
-                    if interrupt_message:
-                        # Process interrupt FIRST to determine action
-                        action_result = await self._process_interrupt_message(
-                            interrupt_message, state, current_node_name, ctx
+        with tracer.start_as_current_span(f"graph_agent_execution {self.name}") as span:
+            span.set_attribute("graph_agent.name", self.name)
+            span.set_attribute("graph_agent.start_node", self.start_node)
+            span.set_attribute("graph_agent.max_iterations", self.max_iterations)
+            try:
+                # Initialize state from session or create new
+                state_dict = ctx.session.state.get("graph_state")
+                if state_dict is None:
+                    # Extract text from Content object (ADK 1.22.1)
+                    user_text = ""
+                    if (
+                        hasattr(ctx, "user_content")
+                        and ctx.user_content
+                        and ctx.user_content.parts
+                    ):
+                        user_text = (
+                            ctx.user_content.parts[0].text
+                            if ctx.user_content.parts[0].text
+                            else ""
                         )
 
-                        # Determine if we should escalate based on action
-                        # Only escalate for 'pause' action
-                        should_escalate = False
-                        if isinstance(action_result, str):
-                            should_escalate = action_result == "pause"
-                        elif isinstance(action_result, tuple):
-                            should_escalate = action_result[0] == "pause"
+                    state = GraphState(
+                        data={"input": user_text}, metadata={"iteration": 0, "path": []}
+                    )
+                else:
+                    # Restore GraphState from dict
+                    state = GraphState(**state_dict)
 
-                        # Yield interrupt event with conditional escalate
+                # Track which parallel groups have been executed
+                executed_parallel_groups = set()
+
+                current_node_name = self.start_node
+                iteration = 0
+
+                while current_node_name and iteration < self.max_iterations:
+                    iteration += 1
+                    current_node = self.nodes[current_node_name]
+
+                    # Check for immediate cancellation (ESC-like interrupt)
+                    # Allows user to abort execution at any time, not just at pause points
+                    if self.interrupt_service and not self.interrupt_service.is_active(
+                        ctx.session.id
+                    ):
+                        logger.info(
+                            "GraphAgent execution cancelled (immediate interrupt) for"
+                            f" session {ctx.session.id}"
+                        )
+                        # Save partial state before cancelling (enables resume/restart)
                         yield Event(
                             author=self.name,
                             content=types.Content(
-                                parts=[
-                                    types.Part(
-                                        text=f"🛑 INTERRUPT (BEFORE): {interrupt_message.text}"
-                                    )
-                                ]
+                                parts=[types.Part(text="⚠️ Execution cancelled by user")]
                             ),
                             actions=EventActions(
-                                escalate=should_escalate,
+                                escalate=False,
                                 state_delta={
-                                    "interrupt_message": interrupt_message.text,
-                                    "interrupt_timing": "before",
-                                    "interrupt_node": current_node_name,
+                                    "graph_cancelled": True,
+                                    "graph_cancelled_at_node": current_node_name,
+                                    "graph_iteration": iteration,
+                                    "graph_state": state.model_dump(),  # Save partial state
+                                    "graph_path": state.metadata.get("path", []),
+                                    "graph_can_resume": (
+                                        True
+                                    ),  # Flag that resume is possible
                                 },
                             ),
                         )
+                        break  # Exit immediately but state is saved
 
-                        # Handle BEFORE interrupt actions
-                        if isinstance(action_result, tuple):
-                            action, target_node = action_result
-                            if action == "go_back":
-                                current_node_name = target_node
-                                continue
-                        elif action_result == "rerun":
-                            continue
-                        elif action_result == "skip":
-                            # Skip this node entirely (BEFORE-only action)
-                            next_node_name = current_node.get_next_node(state)
-                            if next_node_name is None:
-                                break  # No next node, exit loop
-                            current_node_name = next_node_name
-                            continue
-                        elif action_result == "pause":
-                            try:
-                                resumed = await self.interrupt_service.wait_if_paused(
-                                    ctx.session.id
-                                )
-                                if not resumed:
-                                    break
-                            except TimeoutError:
-                                break
-                        # else: continue to execute node
+                    # Track execution path
+                    state.metadata["path"].append(current_node_name)
+                    state.metadata["iteration"] = iteration
 
-                # Execute node with immediate cancellation support
-                # Check cancellation while streaming events from node execution
-                try:
-                    async for event in self._execute_node(current_node, state, ctx):
-                        # Check for immediate cancellation DURING node execution
-                        if (
-                            self.interrupt_service
-                            and not self.interrupt_service.is_active(ctx.session.id)
-                        ):
-                            logger.info(
-                                f"GraphAgent execution cancelled (immediate interrupt during node '{current_node_name}') for session {ctx.session.id}"
+                    # Track invocation IDs per node for rewind integration
+                    node_invocations = state.metadata.setdefault("node_invocations", {})
+                    node_invocations.setdefault(current_node_name, []).append(
+                        ctx.invocation_id
+                    )
+
+                    # Track agent path for nested graph support
+                    agent_path = ctx.session.state.get("_agent_path", [])
+                    agent_path_copy = agent_path.copy()
+                    agent_path_copy.append(self.name)
+                    ctx.session.state["_agent_path"] = agent_path_copy
+
+                    # Update session state for interrupt tracking
+                    ctx.session.state["graph_node"] = current_node_name
+                    ctx.session.state["graph_iteration"] = iteration
+                    ctx.session.state["node_invocations"] = node_invocations
+
+                    # Emit event with invocation tracking (persists to session state)
+                    yield Event(
+                        author=self.name,
+                        actions=EventActions(
+                            state_delta={
+                                "node_invocations": node_invocations,
+                                "graph_current_node": current_node_name,
+                            }
+                        ),
+                    )
+
+                    # Invoke before_node_callback (custom observability)
+                    if self.before_node_callback:
+                        from .callbacks import NodeCallbackContext
+
+                        callback_ctx = NodeCallbackContext(
+                            node=current_node,
+                            state=state,
+                            iteration=iteration,
+                            invocation_context=ctx,
+                            metadata={},
+                        )
+                        event = await self.before_node_callback(callback_ctx)
+                        if event:
+                            yield event
+
+                    # Check for BEFORE-node interrupt (validation timing)
+                    if (
+                        self._should_interrupt_before(current_node_name)
+                        and self.interrupt_service
+                    ):
+                        interrupt_message = (
+                            await self.interrupt_service.check_interrupt(ctx.session.id)
+                        )
+                        if interrupt_message:
+                            # Process interrupt FIRST to determine action
+                            action_result = await self._process_interrupt_message(
+                                interrupt_message, state, current_node_name, ctx
                             )
-                            # Save partial state before cancelling (enables resume/restart)
-                            # Include partial output from node execution
-                            partial_output = state.metadata.get("_last_output", "")
+
+                            # Determine if we should escalate based on action
+                            # Only escalate for 'pause' action
+                            should_escalate = False
+                            if isinstance(action_result, str):
+                                should_escalate = action_result == "pause"
+                            elif isinstance(action_result, tuple):
+                                should_escalate = action_result[0] == "pause"
+
+                            # Yield interrupt event with conditional escalate
                             yield Event(
                                 author=self.name,
                                 content=types.Content(
                                     parts=[
                                         types.Part(
-                                            text=f"⚠️ Execution cancelled during node '{current_node_name}'"
+                                            text=(
+                                                "🛑 INTERRUPT (BEFORE):"
+                                                f" {interrupt_message.text}"
+                                            )
                                         )
                                     ]
                                 ),
                                 actions=EventActions(
-                                    escalate=False,
+                                    escalate=should_escalate,
                                     state_delta={
-                                        "graph_cancelled": True,
-                                        "graph_cancelled_at_node": current_node_name,
-                                        "graph_iteration": iteration,
-                                        "graph_state": state.model_dump(),  # Save partial state
-                                        "graph_path": state.metadata.get("path", []),
-                                        "graph_partial_output": partial_output,  # Partial node output
-                                        "graph_can_resume": True,  # Flag that resume is possible
+                                        "interrupt_message": interrupt_message.text,
+                                        "interrupt_timing": "before",
+                                        "interrupt_node": current_node_name,
                                     },
                                 ),
                             )
-                            return  # Exit immediately but state is saved
-                        yield event
-                except asyncio.CancelledError:
-                    # Task cancelled externally (e.g., timeout, user abort)
-                    logger.info(
-                        f"GraphAgent task cancelled during node '{current_node_name}' for session {ctx.session.id}"
-                    )
-                    # Save partial state before re-raising (enables resume/restart)
-                    partial_output = state.metadata.get("_last_output", "")
-                    yield Event(
-                        author=self.name,
-                        content=types.Content(
-                            parts=[
-                                types.Part(
-                                    text=f"⚠️ Task cancelled during node '{current_node_name}'"
-                                )
-                            ]
-                        ),
-                        actions=EventActions(
-                            escalate=False,
-                            state_delta={
-                                "graph_task_cancelled": True,
-                                "graph_cancelled_at_node": current_node_name,
-                                "graph_iteration": iteration,
-                                "graph_state": state.model_dump(),  # Save partial state
-                                "graph_path": state.metadata.get("path", []),
-                                "graph_partial_output": partial_output,
-                                "graph_can_resume": True,
-                            },
-                        ),
-                    )
-                    raise  # Re-raise to propagate cancellation
 
-                # Update state with node output
-                output = state.metadata.get("_last_output", "")
-                if output:
-                    state = current_node.output_mapper(output, state)
+                            # Handle BEFORE interrupt actions
+                            if isinstance(action_result, tuple):
+                                action, target_node = action_result
+                                if action == "go_back":
+                                    current_node_name = target_node
+                                    continue
+                            elif action_result == "rerun":
+                                continue
+                            elif action_result == "skip":
+                                # Skip this node entirely (BEFORE-only action)
+                                next_node_name = current_node.get_next_node(state)
+                                if next_node_name is None:
+                                    break  # No next node, exit loop
+                                current_node_name = next_node_name
+                                continue
+                            elif action_result == "pause":
+                                try:
+                                    resumed = (
+                                        await self.interrupt_service.wait_if_paused(
+                                            ctx.session.id
+                                        )
+                                    )
+                                    if not resumed:
+                                        break
+                                except TimeoutError:
+                                    break
+                            # else: continue to execute node
 
-                # Invoke after_node_callback (custom observability)
-                if self.after_node_callback:
-                    from .callbacks import NodeCallbackContext
+                    # Check if current node is part of a parallel group
+                    parallel_group_info = self._find_parallel_group(current_node_name)
+                    if parallel_group_info:
+                        group_id, parallel_group = parallel_group_info
 
-                    callback_ctx = NodeCallbackContext(
-                        node=current_node,
-                        state=state,
-                        iteration=iteration,
-                        invocation_context=ctx,
-                        metadata={"output": output},
-                    )
-                    event = await self.after_node_callback(callback_ctx)
-                    if event:
-                        yield event
+                        # Check if this group has already been executed
+                        if group_id in executed_parallel_groups:
+                            # Group already executed, skip this node
+                            logger.info(
+                                f"Skipping node '{current_node_name}' - already executed as"
+                                f" part of parallel group '{group_id}'"
+                            )
+                            # Route to next node from this node's edges
+                            next_node_name = current_node.get_next_node(state)
+                            if next_node_name is None:
+                                if current_node_name in self.end_nodes:
+                                    break
+                                else:
+                                    raise ValueError(
+                                        f"Node {current_node_name} has no outgoing edges and is"
+                                        " not an end node"
+                                    )
+                            current_node_name = next_node_name
+                            continue
 
-                # Check for AFTER-node interrupt (retrospective feedback timing)
-                # This enables retrospective feedback: observe past, steer future
-                if (
-                    self._should_interrupt_after(current_node_name)
-                    and self.interrupt_service
-                ):
-                    interrupt_message = await self.interrupt_service.check_interrupt(
-                        ctx.session.id
-                    )
-                    if interrupt_message:
-                        # Process interrupt message FIRST to determine action
-                        action_result = await self._process_interrupt_message(
-                            interrupt_message, state, current_node_name, ctx
+                        # Execute entire parallel group
+                        logger.info(
+                            f"Executing parallel group '{group_id}' with nodes:"
+                            f" {parallel_group.nodes}"
                         )
 
-                        # Determine if we should escalate based on action
-                        # Only escalate for 'pause' action (wait for human)
-                        # Don't escalate for 'defer', 'continue' (just save and proceed)
-                        should_escalate = False
-                        if isinstance(action_result, str):
-                            should_escalate = action_result == "pause"
-                        elif isinstance(action_result, tuple):
-                            should_escalate = action_result[0] == "pause"
+                        # Collect all events from parallel execution
+                        async for event in execute_parallel_group(
+                            parallel_group,
+                            self.nodes,
+                            state,
+                            ctx,
+                            self._execute_node,
+                        ):
+                            yield event
 
-                        # Yield interrupt event with conditional escalate
-                        # Include session.state updates in state_delta to persist them
-                        state_delta_dict = {
-                            "interrupt_message": interrupt_message.text,
-                            "interrupt_timing": "after",
-                            "interrupt_metadata": interrupt_message.metadata,
-                            "interrupt_action": interrupt_message.action,
-                            "interrupt_node": current_node_name,
-                            "interrupt_state": state.model_dump(),
-                        }
-                        # Include session.state changes (todos, history, decision)
-                        if "_interrupt_todos" in ctx.session.state:
-                            state_delta_dict["_interrupt_todos"] = ctx.session.state[
-                                "_interrupt_todos"
-                            ]
-                        if "_interrupt_history" in ctx.session.state:
-                            state_delta_dict["_interrupt_history"] = ctx.session.state[
-                                "_interrupt_history"
-                            ]
-                        if "_last_interrupt_decision" in ctx.session.state:
-                            state_delta_dict["_last_interrupt_decision"] = (
-                                ctx.session.state["_last_interrupt_decision"]
-                            )
+                        # Mark group as executed
+                        executed_parallel_groups.add(group_id)
 
+                        # After parallel group completes, determine next node
+                        # Use the current node's edges to determine routing
+                        # (all nodes in group should have same outgoing edges)
+                        next_node_name = current_node.get_next_node(state)
+
+                        if next_node_name is None:
+                            # No more nodes after parallel group
+                            if current_node_name in self.end_nodes:
+                                break
+                            else:
+                                raise ValueError(
+                                    f"Parallel group '{group_id}' has no outgoing edges and"
+                                    f" node '{current_node_name}' is not an end node"
+                                )
+
+                        current_node_name = next_node_name
+                        continue  # Skip individual node execution, continue to next iteration
+
+                    # Execute node with immediate cancellation support
+                    # Check cancellation while streaming events from node execution
+                    try:
+                        async for event in self._execute_node(current_node, state, ctx):
+                            # Check for immediate cancellation DURING node execution
+                            if (
+                                self.interrupt_service
+                                and not self.interrupt_service.is_active(ctx.session.id)
+                            ):
+                                logger.info(
+                                    "GraphAgent execution cancelled (immediate interrupt"
+                                    f" during node '{current_node_name}') for session"
+                                    f" {ctx.session.id}"
+                                )
+                                # Save partial state before cancelling (enables resume/restart)
+                                # Include partial output from node execution
+                                partial_output = state.metadata.get("_last_output", "")
+                                yield Event(
+                                    author=self.name,
+                                    content=types.Content(
+                                        parts=[
+                                            types.Part(
+                                                text=(
+                                                    "⚠️ Execution cancelled during node"
+                                                    f" '{current_node_name}'"
+                                                )
+                                            )
+                                        ]
+                                    ),
+                                    actions=EventActions(
+                                        escalate=False,
+                                        state_delta={
+                                            "graph_cancelled": True,
+                                            "graph_cancelled_at_node": current_node_name,
+                                            "graph_iteration": iteration,
+                                            "graph_state": (
+                                                state.model_dump()
+                                            ),  # Save partial state
+                                            "graph_path": state.metadata.get(
+                                                "path", []
+                                            ),
+                                            "graph_partial_output": (
+                                                partial_output
+                                            ),  # Partial node output
+                                            "graph_can_resume": (
+                                                True
+                                            ),  # Flag that resume is possible
+                                        },
+                                    ),
+                                )
+                                return  # Exit immediately but state is saved
+                            yield event
+                    except asyncio.CancelledError:
+                        # Task cancelled externally (e.g., timeout, user abort)
+                        logger.info(
+                            f"GraphAgent task cancelled during node '{current_node_name}'"
+                            f" for session {ctx.session.id}"
+                        )
+                        # Save partial state before re-raising (enables resume/restart)
+                        partial_output = state.metadata.get("_last_output", "")
                         yield Event(
                             author=self.name,
                             content=types.Content(
                                 parts=[
                                     types.Part(
-                                        text=f"🛑 INTERRUPT (AFTER): {interrupt_message.text}"
+                                        text=(
+                                            "⚠️ Task cancelled during node"
+                                            f" '{current_node_name}'"
+                                        )
                                     )
                                 ]
                             ),
                             actions=EventActions(
-                                escalate=should_escalate,
-                                state_delta=state_delta_dict,
+                                escalate=False,
+                                state_delta={
+                                    "graph_task_cancelled": True,
+                                    "graph_cancelled_at_node": current_node_name,
+                                    "graph_iteration": iteration,
+                                    "graph_state": state.model_dump(),  # Save partial state
+                                    "graph_path": state.metadata.get("path", []),
+                                    "graph_partial_output": partial_output,
+                                    "graph_can_resume": True,
+                                },
                             ),
                         )
+                        raise  # Re-raise to propagate cancellation
 
-                        # Handle action result (can be string or tuple for go_back)
-                        if isinstance(action_result, tuple):
-                            # go_back returns ("go_back", target_node)
-                            action, target_node = action_result
-                            if action == "go_back":
-                                current_node_name = target_node
-                                continue  # Jump to target node
-                        elif action_result == "rerun":
-                            # Stay on same node, loop will re-execute
-                            continue
-                        elif action_result == "pause":
-                            # Wait for resume
-                            try:
-                                resumed = await self.interrupt_service.wait_if_paused(
-                                    ctx.session.id
-                                )
-                                if not resumed:  # Cancelled
-                                    logger.info(
-                                        f"GraphAgent execution cancelled for session {ctx.session.id}"
-                                    )
-                                    break
-                            except TimeoutError as e:
-                                logger.warning(f"Interrupt wait timeout: {e}")
-                                # Continue execution after timeout
-                                break
-                        # else: continue (accept results, proceed to next node)
+                    # Update state with node output
+                    output = state.metadata.get("_last_output", "")
+                    if output:
+                        state = current_node.output_mapper(output, state)
 
-                # Checkpointing - yield event with state_delta to persist checkpoint
-                # Note: For full checkpoint/resume functionality, use CheckpointCallback
-                if self.checkpointing:
-                    checkpoint_data = {
-                        "graph_state": state.model_dump(),
-                        "graph_checkpoint": {
-                            "node": current_node_name,
-                            "iteration": iteration,
+                    # Invoke after_node_callback (custom observability)
+                    if self.after_node_callback:
+                        from .callbacks import NodeCallbackContext
+
+                        callback_ctx = NodeCallbackContext(
+                            node=current_node,
+                            state=state,
+                            iteration=iteration,
+                            invocation_context=ctx,
+                            metadata={"output": output},
+                        )
+                        event = await self.after_node_callback(callback_ctx)
+                        if event:
+                            yield event
+
+                    # Emit graph metadata event for evaluation framework
+                    # This will be captured in Invocation.intermediate_data by EvaluationGenerator
+                    # Set partial=True so is_final_response() returns False (making it an intermediate event)
+                    graph_metadata = {
+                        "graph_node": current_node_name,
+                        "graph_iteration": iteration,
+                        "graph_path": state.metadata.get("path", []),
+                        "node_invocations": {
+                            name: len(invocs)
+                            for name, invocs in state.metadata.get(
+                                "node_invocations", {}
+                            ).items()
                         },
+                        "graph_state": dict(
+                            state.data
+                        ),  # Include state for evaluation metrics
                     }
-                    # Update session state directly for immediate access
-                    ctx.session.state.update(checkpoint_data)
-                    # Also yield event with state_delta for proper persistence
                     yield Event(
-                        author=self.name,
+                        author=f"{self.name}#metadata",
                         content=types.Content(
-                            parts=[types.Part(text=f"Checkpoint: {current_node_name}")]
+                            parts=[types.Part(text=f"[GraphMetadata] {graph_metadata}")]
                         ),
-                        actions=EventActions(state_delta=checkpoint_data),
+                        partial=True,  # Mark as intermediate event
                     )
 
-                # Get next node via conditional routing
-                next_node_name = current_node.get_next_node(state)
-                if next_node_name is None:
-                    # No more edges - check if we're at an end node
-                    if current_node_name in self.end_nodes:
-                        break
-                    else:
-                        # Not at an end node and no edges - error
-                        raise ValueError(
-                            f"Node {current_node_name} has no outgoing edges and is not an end node"
+                    # Check for AFTER-node interrupt (retrospective feedback timing)
+                    # This enables retrospective feedback: observe past, steer future
+                    if (
+                        self._should_interrupt_after(current_node_name)
+                        and self.interrupt_service
+                    ):
+                        interrupt_message = (
+                            await self.interrupt_service.check_interrupt(ctx.session.id)
+                        )
+                        if interrupt_message:
+                            # Process interrupt message FIRST to determine action
+                            action_result = await self._process_interrupt_message(
+                                interrupt_message, state, current_node_name, ctx
+                            )
+
+                            # Determine if we should escalate based on action
+                            # Only escalate for 'pause' action (wait for human)
+                            # Don't escalate for 'defer', 'continue' (just save and proceed)
+                            should_escalate = False
+                            if isinstance(action_result, str):
+                                should_escalate = action_result == "pause"
+                            elif isinstance(action_result, tuple):
+                                should_escalate = action_result[0] == "pause"
+
+                            # Yield interrupt event with conditional escalate
+                            # Include session.state updates in state_delta to persist them
+                            state_delta_dict = {
+                                "interrupt_message": interrupt_message.text,
+                                "interrupt_timing": "after",
+                                "interrupt_metadata": interrupt_message.metadata,
+                                "interrupt_action": interrupt_message.action,
+                                "interrupt_node": current_node_name,
+                                "interrupt_state": state.model_dump(),
+                            }
+                            # Include session.state changes (todos, history, decision)
+                            if "_interrupt_todos" in ctx.session.state:
+                                state_delta_dict["_interrupt_todos"] = (
+                                    ctx.session.state["_interrupt_todos"]
+                                )
+                            if "_interrupt_history" in ctx.session.state:
+                                state_delta_dict["_interrupt_history"] = (
+                                    ctx.session.state["_interrupt_history"]
+                                )
+                            if "_last_interrupt_decision" in ctx.session.state:
+                                state_delta_dict["_last_interrupt_decision"] = (
+                                    ctx.session.state["_last_interrupt_decision"]
+                                )
+
+                            yield Event(
+                                author=self.name,
+                                content=types.Content(
+                                    parts=[
+                                        types.Part(
+                                            text=(
+                                                "🛑 INTERRUPT (AFTER):"
+                                                f" {interrupt_message.text}"
+                                            )
+                                        )
+                                    ]
+                                ),
+                                actions=EventActions(
+                                    escalate=should_escalate,
+                                    state_delta=state_delta_dict,
+                                ),
+                            )
+
+                            # Handle action result (can be string or tuple for go_back)
+                            if isinstance(action_result, tuple):
+                                # go_back returns ("go_back", target_node)
+                                action, target_node = action_result
+                                if action == "go_back":
+                                    current_node_name = target_node
+                                    continue  # Jump to target node
+                            elif action_result == "rerun":
+                                # Stay on same node, loop will re-execute
+                                continue
+                            elif action_result == "pause":
+                                # Wait for resume
+                                try:
+                                    resumed = (
+                                        await self.interrupt_service.wait_if_paused(
+                                            ctx.session.id
+                                        )
+                                    )
+                                    if not resumed:  # Cancelled
+                                        logger.info(
+                                            "GraphAgent execution cancelled for session"
+                                            f" {ctx.session.id}"
+                                        )
+                                        break
+                                except TimeoutError as e:
+                                    logger.warning(f"Interrupt wait timeout: {e}")
+                                    # Continue execution after timeout
+                                    break
+                            # else: continue (accept results, proceed to next node)
+
+                    # Checkpointing - yield event with state_delta to persist checkpoint
+                    # Note: For full checkpoint/resume functionality, use CheckpointCallback
+                    if self.checkpointing:
+                        checkpoint_data = {
+                            "graph_state": state.model_dump(),
+                            "graph_checkpoint": {
+                                "node": current_node_name,
+                                "iteration": iteration,
+                            },
+                        }
+                        # Update session state directly for immediate access
+                        ctx.session.state.update(checkpoint_data)
+                        # Also yield event with state_delta for proper persistence
+                        yield Event(
+                            author=self.name,
+                            content=types.Content(
+                                parts=[
+                                    types.Part(text=f"Checkpoint: {current_node_name}")
+                                ]
+                            ),
+                            actions=EventActions(state_delta=checkpoint_data),
                         )
 
-                current_node_name = next_node_name
+                    # Get next node via conditional routing
+                    next_node_name = current_node.get_next_node(state)
+                    if next_node_name is None:
+                        # No more edges - check if we're at an end node
+                        if current_node_name in self.end_nodes:
+                            break
+                        else:
+                            # Not at an end node and no edges - error
+                            raise ValueError(
+                                f"Node {current_node_name} has no outgoing edges and is not"
+                                " an end node"
+                            )
 
-            # Final response
-            final_output = state.data.get(
-                "final_output", state.data.get(current_node_name, "")
-            )
+                    current_node_name = next_node_name
 
-            # Format final response with execution metadata
-            response_text = f"{final_output}"
+                # Final response - yield event with graph metadata
+                # Include last node's output ONLY if:
+                # 1. explicit final_output is set, OR
+                # 2. last node was a function (doesn't yield events, so we need to show output)
+                # Don't include output for agent nodes (they already yielded their output)
+                final_output = state.data.get("final_output", "")
 
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[types.Part(text=response_text)]),
-                actions=EventActions(
-                    state_delta={
-                        "graph_state": state.model_dump(),
-                        "graph_iterations": iteration,
-                        "graph_path": state.metadata["path"],
-                    }
-                ),
-            )
+                # If no explicit final_output, check if last node was a function
+                if not final_output and current_node_name:
+                    last_node = self.nodes.get(current_node_name)
+                    if last_node and last_node.function:
+                        # Function node - include its output
+                        final_output = state.data.get(current_node_name, "")
 
-        finally:
-            # Unregister session from InterruptService
-            if self.interrupt_service:
-                self.interrupt_service.unregister_session(ctx.session.id)
+                response_text = f"{final_output}"
+
+                yield Event(
+                    author=self.name,
+                    content=types.Content(parts=[types.Part(text=response_text)]),
+                    actions=EventActions(
+                        state_delta={
+                            "graph_state": state.model_dump(),
+                            "graph_iterations": iteration,
+                            "graph_path": state.metadata["path"],
+                        }
+                    ),
+                )
+
+            finally:
+                # Unregister session from InterruptService and finalize tracing
+                if self.interrupt_service:
+                    self.interrupt_service.unregister_session(ctx.session.id)
+                span.set_attribute("graph_agent.completed", True)
 
     async def _process_interrupt_message(  # type: ignore[no-untyped-def]
         self,
@@ -839,7 +1151,8 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                 "timestamp": time.time(),
             }
             logger.info(
-                f"InterruptReasoner decided: {action_obj.action} - {action_obj.reasoning}"
+                f"InterruptReasoner decided: {action_obj.action} -"
+                f" {action_obj.reasoning}"
             )
         else:
             # Fallback: use message.action directly
@@ -909,13 +1222,15 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                     state.data.pop(node_name, None)
 
                 logger.info(
-                    f"Going back {steps} steps to node '{target_node}' (cleared: {nodes_to_clear})"
+                    f"Going back {steps} steps to node '{target_node}' (cleared:"
+                    f" {nodes_to_clear})"
                 )
                 # Return tuple (action, target_node) for control flow
                 return ("go_back", target_node)
             else:
                 logger.warning(
-                    f"Cannot go back {steps} steps, only {len(current_path)} nodes in path. Continuing."
+                    f"Cannot go back {steps} steps, only {len(current_path)} nodes in"
+                    " path. Continuing."
                 )
                 return "continue"
 
@@ -934,7 +1249,7 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                     if key.startswith("_") or key.startswith("graph_"):
                         raise ValueError(
                             f"Cannot update reserved key '{key}'. "
-                            f"Reserved prefixes: '_', 'graph_'"
+                            "Reserved prefixes: '_', 'graph_'"
                         )
                 # Safe to merge
                 state.data.update(action.parameters)
@@ -1101,7 +1416,10 @@ async def example_react_pattern():  # type: ignore[no-untyped-def]  # pragma: no
     runner = Runner(agent=graph, session_service=InMemorySessionService())
 
     session_id = "react-session-001"
-    user_input = "Find information about the latest Python ADK release and summarize key features."
+    user_input = (
+        "Find information about the latest Python ADK release and summarize key"
+        " features."
+    )
 
     print(f"Running ReAct pattern for: {user_input}\n")
 

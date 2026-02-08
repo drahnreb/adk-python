@@ -44,6 +44,12 @@ from .interrupt_service import InterruptService
 from .interrupt_service import InterruptServiceConfig
 from .interrupt_service import QueueStatus
 from .interrupt_service import SessionMetrics
+from .parallel import ErrorPolicy
+from .parallel import JoinStrategy
+from .parallel import ParallelNodeGroup
+from .evaluation_metrics import graph_path_match
+from .evaluation_metrics import state_contains_keys
+from .evaluation_metrics import node_execution_count
 
 # Sentinel constants for graph boundaries
 START = "__start__"
@@ -73,6 +79,12 @@ __all__ = [
     "NodeCallback",
     "EdgeCallback",
     "create_nested_observability_callback",
+    "ParallelNodeGroup",
+    "JoinStrategy",
+    "ErrorPolicy",
+    "graph_path_match",
+    "state_contains_keys",
+    "node_execution_count",
     "START",
     "END",
 ]

@@ -110,9 +110,14 @@ class GraphNode:
         return new_state
 
     def get_next_node(self, state: GraphState) -> Optional[str]:
-        """Determine next node based on conditional edges.
+        """Determine next node based on conditional edges with priority and weight.
 
-        Evaluates edge conditions in order and returns the first matching target.
+        Enhanced routing logic:
+        1. Sort edges by priority (highest first), preserving insertion order
+        2. Evaluate conditions in priority order
+        3. Within same priority, return first match (insertion order)
+        4. If edges have different weights, use weighted random selection
+        5. Priority 0 edges are fallbacks (always match if no higher priority matched)
 
         Args:
             state: Current graph state
@@ -120,7 +125,63 @@ class GraphNode:
         Returns:
             Name of next node, or None if no edge matches
         """
-        for edge in self.edges:
+        import random
+
+        if not self.edges:
+            return None
+
+        # Sort edges by priority (highest first)
+        # Use enumerate to track original insertion order
+        indexed_edges = [(i, e) for i, e in enumerate(self.edges)]
+        # Sort by priority DESC, then by index ASC (stable sort preserves insertion order)
+        sorted_edges = sorted(indexed_edges, key=lambda x: (-x[1].priority, x[0]))
+
+        # Group edges by priority
+        current_priority = sorted_edges[0][1].priority
+        matching_edges: list[tuple[int, EdgeCondition]] = []
+
+        for idx, edge in sorted_edges:
+            # If we've moved to a lower priority and already have matches, stop
+            if edge.priority < current_priority and matching_edges:
+                break
+
+            # Update current priority
+            current_priority = edge.priority
+
+            # Check if edge matches
             if edge.should_route(state):
+                matching_edges.append((idx, edge))
+
+        # No matching edges
+        if not matching_edges:
+            return None
+
+        # Single matching edge - return it
+        if len(matching_edges) == 1:
+            return matching_edges[0][1].target_node
+
+        # Multiple matching edges at same priority
+        # Check if weights are all the same (default behavior: first match)
+        weights = [e.weight for _, e in matching_edges]
+        all_same_weight = len(set(weights)) == 1
+
+        if all_same_weight:
+            # All weights equal - return first match in insertion order
+            return matching_edges[0][1].target_node
+
+        # Different weights - use weighted random selection
+        total_weight = sum(weights)
+        if total_weight == 0:
+            # All weights are 0, pick first one
+            return matching_edges[0][1].target_node
+
+        # Weighted random choice
+        rand_value = random.random() * total_weight
+        cumulative = 0.0
+        for idx, edge in matching_edges:
+            cumulative += edge.weight
+            if rand_value <= cumulative:
                 return edge.target_node
-        return None
+
+        # Fallback (shouldn't reach here, but safety)
+        return matching_edges[-1][1].target_node

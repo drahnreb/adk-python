@@ -7,12 +7,14 @@ This service provides checkpoint/resume capabilities using existing ADK primitiv
 The service is stateless - all checkpoint data is stored in session state.
 """
 
-import json
-import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+import json
+import time
+from typing import Any
+from typing import AsyncIterator
+from typing import Optional
+import uuid
 
 from ..artifacts.base_artifact_service import BaseArtifactService
 from ..events.event import Event
@@ -178,9 +180,9 @@ class CheckpointService:
                 current_count = len(checkpoint_index)
                 if current_count >= self.config.max_checkpoints_per_session:
                     raise ValueError(
-                        f"Checkpoint limit reached: {current_count} checkpoints exist "
-                        f"(max: {self.config.max_checkpoints_per_session}). "
-                        f"Delete old checkpoints or increase max_checkpoints_per_session limit."
+                        f"Checkpoint limit reached: {current_count} checkpoints exist"
+                        f" (max: {self.config.max_checkpoints_per_session}). Delete old"
+                        " checkpoints or increase max_checkpoints_per_session limit."
                     )
 
             # Collect artifact versions if artifact service available
@@ -252,10 +254,10 @@ class CheckpointService:
                 state_size = len(json.dumps(state_snapshot).encode("utf-8"))
                 if state_size > self.config.max_state_size_bytes:
                     raise ValueError(
-                        f"State size {state_size} bytes exceeds limit "
-                        f"({self.config.max_state_size_bytes} bytes). "
-                        f"Consider using delta compression (use_delta=True) or "
-                        f"reducing state size. Current state has {len(state_snapshot)} keys."
+                        f"State size {state_size} bytes exceeds limit"
+                        f" ({self.config.max_state_size_bytes} bytes). Consider using"
+                        " delta compression (use_delta=True) or reducing state size."
+                        f" Current state has {len(state_snapshot)} keys."
                     )
 
             # Create checkpoint metadata
@@ -306,12 +308,14 @@ class CheckpointService:
         self,
         session: Session,
         checkpoint_id: str,
+        reconstruct_delta: bool = False,
     ) -> Optional[CheckpointMetadata]:
         """Retrieve checkpoint metadata from session state.
 
         Args:
             session: Session containing the checkpoint
             checkpoint_id: Checkpoint identifier
+            reconstruct_delta: If True and checkpoint is delta, reconstruct full state
 
         Returns:
             CheckpointMetadata if checkpoint exists, None otherwise
@@ -323,7 +327,38 @@ class CheckpointService:
             if checkpoint_data is None:
                 return None
 
-            return CheckpointMetadata(**checkpoint_data)
+            metadata = CheckpointMetadata(**checkpoint_data)
+
+            # Reconstruct full state from delta chain if requested
+            if reconstruct_delta and metadata.is_delta and metadata.base_checkpoint_id:
+                # Load base checkpoint (recursively reconstruct if it's also a delta)
+                base_metadata = await self.get_checkpoint(
+                    session, metadata.base_checkpoint_id, reconstruct_delta=True
+                )
+
+                if base_metadata is None:
+                    # Base checkpoint was deleted - return None to signal corruption
+                    import logging
+
+                    logger = logging.getLogger("google_adk.checkpoints")
+                    logger.warning(
+                        f"Base checkpoint {metadata.base_checkpoint_id} not found "
+                        f"for delta checkpoint {checkpoint_id}. Delta chain is broken."
+                    )
+                    return None
+
+                # Reconstruct full state by applying delta on top of base
+                full_state = dict(base_metadata.state_snapshot)
+                for key, value in metadata.state_snapshot.items():
+                    if value is None:  # Deletion marker
+                        full_state.pop(key, None)
+                    else:
+                        full_state[key] = value
+
+                # Return metadata with full state
+                metadata.state_snapshot = full_state
+
+            return metadata
 
     async def list_checkpoints(
         self,
@@ -421,8 +456,10 @@ class CheckpointService:
             CheckpointMetadata if checkpoint exists, None otherwise
         """
         async with self._traced("restore", checkpoint_id, session.id):
-            # Get checkpoint metadata
-            metadata = await self.get_checkpoint(session, checkpoint_id)
+            # Get checkpoint metadata with delta reconstruction
+            metadata = await self.get_checkpoint(
+                session, checkpoint_id, reconstruct_delta=True
+            )
             if metadata is None:
                 return None
 
@@ -452,7 +489,7 @@ class CheckpointService:
                     for filename, version in artifact_versions.items():
                         try:
                             # Get artifact at checkpoint version
-                            artifact_data = await self.artifact_service.get_artifact(
+                            artifact_data = await self.artifact_service.load_artifact(
                                 app_name=session.app_name,
                                 user_id=session.user_id,
                                 session_id=session.id,
@@ -467,7 +504,7 @@ class CheckpointService:
                                     user_id=session.user_id,
                                     session_id=session.id,
                                     filename=filename,
-                                    data=artifact_data,
+                                    artifact=artifact_data,
                                 )
                         except Exception as e:
                             logger.warning(
