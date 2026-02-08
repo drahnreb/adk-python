@@ -44,23 +44,45 @@ from google.genai import types
 # ============================================================================
 
 
-class MockAgent:
-    """Mock agent that returns predetermined responses."""
+class SimpleTestAgent(BaseAgent):
+    """Real test agent that extends BaseAgent per ADK guidelines.
+
+    This replaces MockAgent to comply with ADK testing guidelines:
+    - Extends BaseAgent (not a mock)
+    - Implements _run_async_impl (proper agent pattern)
+    - Uses real agent infrastructure
+
+    Uses private attributes to store test data to avoid Pydantic validation.
+    """
+
+    model_config = {"extra": "allow", "arbitrary_types_allowed": True}
 
     def __init__(self, name: str, responses: list[str], delay: float = 0.0):
-        self.name = name
-        self.responses = responses
-        self.call_count = 0
-        self.delay = delay
+        super().__init__(name=name)
+        # Use object.__setattr__ to bypass Pydantic for extra attributes
+        object.__setattr__(self, "_responses", responses)
+        object.__setattr__(self, "_call_count", 0)
+        object.__setattr__(self, "_delay", delay)
 
-    async def run_async(self, ctx):
-        """Mock run_async that yields predetermined responses."""
-        await asyncio.sleep(self.delay)  # Simulate LLM latency
-        response = self.responses[min(self.call_count, len(self.responses) - 1)]
-        self.call_count += 1
+    async def _run_async_impl(self, ctx):
+        """Real agent implementation that yields predetermined responses."""
+        delay = object.__getattribute__(self, "_delay")
+        await asyncio.sleep(delay)  # Simulate processing time
+
+        call_count = object.__getattribute__(self, "_call_count")
+        responses = object.__getattribute__(self, "_responses")
+
+        response = responses[min(call_count, len(responses) - 1)]
+        object.__setattr__(self, "_call_count", call_count + 1)
+
         yield Event(
             author=self.name, content=types.Content(parts=[types.Part(text=response)])
         )
+
+    @property
+    def call_count(self):
+        """Get number of times agent was called."""
+        return object.__getattribute__(self, "_call_count")
 
 
 class MockLlmAgent(LlmAgent):
@@ -315,7 +337,7 @@ class TestCyclicExecution:
 
         # Counter agent that increments
         counter_responses = [str(i) for i in range(1, 10)]
-        counter_agent = MockAgent("counter", counter_responses)
+        counter_agent = SimpleTestAgent("counter", counter_responses)
 
         graph.add_node(
             GraphNode(
@@ -367,7 +389,7 @@ class TestCyclicExecution:
         graph = GraphAgent(name="infinite", max_iterations=3)
 
         # Agent that never ends
-        loop_agent = MockAgent("loop", ["continue"] * 100)
+        loop_agent = SimpleTestAgent("loop", ["continue"] * 100)
 
         graph.add_node(GraphNode(name="loop", agent=loop_agent))
         graph.set_start("loop")
@@ -404,9 +426,9 @@ class TestCyclicExecution:
         graph = GraphAgent(name="react", max_iterations=10)
 
         # Simulate ReAct: Complete after 2 iterations
-        reason_agent = MockAgent("reason", ["plan action 1", "plan action 2"])
-        act_agent = MockAgent("act", ["result 1", "result 2"])
-        observe_agent = MockAgent("observe", ["CONTINUE", "COMPLETE"])
+        reason_agent = SimpleTestAgent("reason", ["plan action 1", "plan action 2"])
+        act_agent = SimpleTestAgent("act", ["result 1", "result 2"])
+        observe_agent = SimpleTestAgent("observe", ["CONTINUE", "COMPLETE"])
 
         graph.add_node(GraphNode(name="reason", agent=reason_agent))
         graph.add_node(GraphNode(name="act", agent=act_agent))
@@ -481,8 +503,8 @@ class TestCheckpointing:
         """Test that checkpointing saves state after each node."""
         graph = GraphAgent(name="test", checkpointing=True)
 
-        agent1 = MockAgent("agent1", ["step1"])
-        agent2 = MockAgent("agent2", ["step2"])
+        agent1 = SimpleTestAgent("agent1", ["step1"])
+        agent2 = SimpleTestAgent("agent2", ["step2"])
 
         graph.add_node(GraphNode(name="node1", agent=agent1))
         graph.add_node(GraphNode(name="node2", agent=agent2))
@@ -526,7 +548,7 @@ class TestCheckpointing:
         """Test checkpoint contains graph state."""
         graph = GraphAgent(name="test", checkpointing=True)
 
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="worker", agent=agent))
         graph.set_start("worker")
         graph.set_end("worker")
@@ -596,7 +618,9 @@ class TestAgentTypeSupport:
                 event_texts.append(event.content.parts[0].text)
 
         # Check that llm agent's response appears in events
-        assert any("llm response" in text for text in event_texts), f"Expected 'llm response' in events, got {event_texts}"
+        assert any(
+            "llm response" in text for text in event_texts
+        ), f"Expected 'llm response' in events, got {event_texts}"
         assert llm_agent.call_count == 1
 
     async def test_custom_function_node(self):
@@ -705,7 +729,7 @@ class TestErrorHandling:
     def test_add_edge_invalid_source(self):
         """Test add_edge raises error for non-existent source node."""
         graph = GraphAgent(name="test")
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="node1", agent=agent))
 
         with pytest.raises(ValueError, match="Source node invalid not found"):
@@ -716,7 +740,7 @@ class TestErrorHandling:
         """Test execution raises error when node has no edges and is not an end node."""
         graph = GraphAgent(name="test")
 
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="node1", agent=agent))
         graph.set_start("node1")
         # Don't set as end node and don't add edges
@@ -744,7 +768,7 @@ class TestErrorHandling:
         """Test execution raises error when start node is not set."""
         graph = GraphAgent(name="test")
 
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="node1", agent=agent))
         # Don't set start node
 
@@ -819,7 +843,7 @@ class TestStateRestoration:
         """Test that graph can restore state from session."""
         graph = GraphAgent(name="test", checkpointing=True)
 
-        agent = MockAgent("agent", ["response1", "response2"])
+        agent = SimpleTestAgent("agent", ["response1", "response2"])
         graph.add_node(GraphNode(name="node1", agent=agent))
         graph.set_start("node1")
         graph.set_end("node1")
@@ -892,7 +916,7 @@ class TestADKConformity:
         """Test that GraphAgent yields proper Event objects."""
         graph = GraphAgent(name="test")
 
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="node1", agent=agent))
         graph.set_start("node1")
         graph.set_end("node1")
@@ -967,7 +991,7 @@ class TestADKConformity:
         """Test that state changes use EventActions.state_delta."""
         graph = GraphAgent(name="test", checkpointing=True)
 
-        agent = MockAgent("agent", ["response"])
+        agent = SimpleTestAgent("agent", ["response"])
         graph.add_node(GraphNode(name="node1", agent=agent))
         graph.set_start("node1")
         graph.set_end("node1")
