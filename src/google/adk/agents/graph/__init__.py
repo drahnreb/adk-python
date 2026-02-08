@@ -27,6 +27,9 @@ from .callbacks import NodeCallback
 from .callbacks import NodeCallbackContext
 from .callbacks import create_nested_observability_callback
 from .graph_agent import GraphAgent
+from .graph_agent_config import GraphAgentConfig
+from .graph_agent_config import GraphEdgeConfig
+from .graph_agent_config import GraphNodeConfig
 from .graph_edge import EdgeCondition
 from .graph_events import GraphEvent
 from .graph_events import GraphEventType
@@ -57,6 +60,9 @@ END = "__end__"
 
 __all__ = [
     "GraphAgent",
+    "GraphAgentConfig",
+    "GraphNodeConfig",
+    "GraphEdgeConfig",
     "GraphState",
     "GraphNode",
     "EdgeCondition",

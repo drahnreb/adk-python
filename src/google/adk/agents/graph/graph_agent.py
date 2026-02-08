@@ -1303,6 +1303,60 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
             nodes is None or node_name in nodes
         )
 
+    @override
+    @classmethod
+    def _parse_config(
+        cls,
+        config: Any,  # GraphAgentConfig
+        config_abs_path: str,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Parse GraphAgentConfig and return kwargs for GraphAgent constructor.
+
+        Args:
+            config: GraphAgentConfig instance
+            config_abs_path: Absolute path to config file
+            kwargs: Base kwargs from BaseAgent
+
+        Returns:
+            Updated kwargs with graph-specific configuration
+        """
+        from .graph_agent_config import GraphAgentConfig
+
+        if not isinstance(config, GraphAgentConfig):
+            return kwargs
+
+        # Basic graph config
+        if hasattr(config, "start_node") and config.start_node:
+            kwargs["start_node"] = config.start_node
+
+        if hasattr(config, "max_iterations") and config.max_iterations:
+            kwargs["max_iterations"] = config.max_iterations
+
+        if hasattr(config, "checkpointing"):
+            kwargs["checkpointing"] = config.checkpointing
+
+        # NOTE: Nodes, edges, and advanced features require the graph to be
+        # constructed first, so they are handled in a separate initialization
+        # phase. For now, _parse_config only handles scalar configuration values.
+        #
+        # Future enhancement: Add post-construction configuration phase that:
+        # 1. Resolves agent references from config.nodes
+        # 2. Constructs GraphNode instances
+        # 3. Adds edges with conditions
+        # 4. Sets up parallel groups
+        # 5. Configures interrupts and callbacks
+        #
+        # This would enable full YAML-based graph definitions like:
+        #   nodes:
+        #     - name: start
+        #       sub_agents: [researcher]
+        #   edges:
+        #     - from_node: start
+        #       to_node: end
+
+        return kwargs
+
 
 # ============================================================================
 # Example Usage: ReAct Pattern with Graph
