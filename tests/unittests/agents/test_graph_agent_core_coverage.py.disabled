@@ -106,25 +106,24 @@ class TestImmediateCancellation:
         # Create session and register with interrupt service
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         # Cancel after first node completes
         async def cancel_after_delay():
             await asyncio.sleep(0.1)
-            interrupt_service.cancel(session.id)
+            await interrupt_service.cancel(session.id)
 
         cancel_task = asyncio.create_task(cancel_after_delay())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -178,7 +177,7 @@ class TestBeforeInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         # Send SKIP interrupt for node2
@@ -192,14 +191,13 @@ class TestBeforeInterruptHandling:
         skip_task = asyncio.create_task(send_skip_interrupt())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -235,7 +233,7 @@ class TestBeforeInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         # Send PAUSE interrupt then resume
@@ -253,14 +251,13 @@ class TestBeforeInterruptHandling:
         pause_task = asyncio.create_task(pause_and_resume())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -290,7 +287,7 @@ class TestBeforeInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         rerun_count = 0
@@ -308,14 +305,13 @@ class TestBeforeInterruptHandling:
         rerun_task = asyncio.create_task(send_rerun_once())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -358,7 +354,7 @@ class TestAfterInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         # Send PAUSE interrupt after node1
@@ -374,14 +370,13 @@ class TestAfterInterruptHandling:
         pause_task = asyncio.create_task(pause_and_resume())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -413,7 +408,7 @@ class TestAfterInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         rerun_sent = False
@@ -433,14 +428,13 @@ class TestAfterInterruptHandling:
         rerun_task = asyncio.create_task(send_rerun_after_first())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
@@ -473,7 +467,7 @@ class TestAfterInterruptHandling:
         # Create session
         app_name = "test"
         user_id = "u1"
-        session = await session_service.create_session(app_name, user_id)
+        session = await session_service.create_session(app_name=app_name, user_id=user_id)
         interrupt_service.register_session(session.id)
 
         # Send CONTINUE interrupt (accept results and proceed)
@@ -489,14 +483,13 @@ class TestAfterInterruptHandling:
         continue_task = asyncio.create_task(send_continue())
 
         # Execute
-        runner = Runner(agent=graph, session_service=session_service)
+        runner = Runner(app_name="test_app", agent=graph, session_service=session_service, auto_create_session=True)
 
         events = []
         async for event in runner.run_async(
-            app_name=app_name,
             user_id=user_id,
             session_id=session.id,
-            new_message="start",
+            new_message=types.Content(parts=[types.Part(text="start")]),
         ):
             if event.content and event.content.parts:
                 events.append(event.content.parts[0].text)
