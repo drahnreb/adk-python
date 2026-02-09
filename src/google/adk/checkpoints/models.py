@@ -6,6 +6,7 @@ from typing import Any
 from typing import Optional
 
 from pydantic import BaseModel
+from pydantic import ConfigDict
 from pydantic import Field
 
 
@@ -42,6 +43,8 @@ class CheckpointMetadata(BaseModel):  # type: ignore[misc]
     Stored in session state and provides information about checkpoint creation
     and artifact versions at checkpoint time.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     checkpoint_id: str = Field(description="Unique identifier for this checkpoint")
 
@@ -91,6 +94,8 @@ class ListCheckpointsResponse(BaseModel):  # type: ignore[misc]
 
     Following ADK pagination patterns (similar to ConversationListResponse).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     checkpoints: list[CheckpointMetadata] = Field(
         default_factory=list,
