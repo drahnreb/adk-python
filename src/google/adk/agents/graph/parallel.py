@@ -17,6 +17,7 @@ from typing import List
 from typing import Optional
 
 from ...events.event import Event
+from ...telemetry.tracing import tracer
 from ...utils.feature_decorator import experimental
 from .graph_state import GraphState
 
@@ -138,111 +139,155 @@ async def execute_parallel_group(
     Raises:
         Exception: If error_policy is FAIL_FAST and a node fails
     """
-    logger.info(
-        f"Executing parallel group with {len(group.nodes)} nodes: {group.nodes}"
-    )
+    with tracer.start_as_current_span("parallel_group_execution") as span:
+        span.set_attribute("parallel.node_count", len(group.nodes))
+        span.set_attribute("parallel.join_strategy", group.join_strategy.value)
+        span.set_attribute("parallel.error_policy", group.error_policy.value)
+        span.set_attribute("parallel.nodes", ",".join(group.nodes))
 
-    # Create isolated state copies for each branch
-    branch_states = {}
-    node_generators = {}
-
-    for node_name in group.nodes:
-        if node_name not in nodes:
-            raise ValueError(f"Node '{node_name}' not found in graph")
-
-        # Create isolated branch context with deep copy for proper isolation
-        branch_state = GraphState(
-            data=deepcopy(state.data), metadata=deepcopy(state.metadata)
+        logger.info(
+            f"Executing parallel group with {len(group.nodes)} nodes: {group.nodes}"
         )
-        branch_states[node_name] = branch_state
 
-        # Create generator for each node
-        node = nodes[node_name]
-        node_generators[node_name] = execute_node_fn(node, branch_state, ctx)
+        # Create isolated state copies for each branch
+        branch_states = {}
+        node_generators = {}
 
-    # Start all executions (ParallelAgent pattern)
-    tasks = {
-        node_name: asyncio.create_task(_collect_events(gen))
-        for node_name, gen in node_generators.items()
-    }
+        for node_name in group.nodes:
+            if node_name not in nodes:
+                raise ValueError(f"Node '{node_name}' not found in graph")
 
-    pending = set(tasks.values())
-    results = {}
-    errors = []
+            # Create isolated branch context with deep copy for proper isolation
+            branch_state = GraphState(
+                data=deepcopy(state.data), metadata=deepcopy(state.metadata)
+            )
+            branch_states[node_name] = branch_state
 
-    # Wait for completions based on join strategy
-    num_to_wait = {
-        JoinStrategy.WAIT_ALL: len(group.nodes),
-        JoinStrategy.WAIT_ANY: 1,
-        JoinStrategy.WAIT_N: group.wait_n,
-    }[group.join_strategy]
+            # Create generator for each node
+            node = nodes[node_name]
+            node_generators[node_name] = execute_node_fn(node, branch_state, ctx)
 
-    completed_count = 0
+        # Start all executions (ParallelAgent pattern)
+        tasks = {
+            node_name: asyncio.create_task(_collect_events(gen))
+            for node_name, gen in node_generators.items()
+        }
 
-    while pending and completed_count < num_to_wait:
-        # Wait for next completion (FIRST_COMPLETED pattern)
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        # Create inverse mapping for O(1) task lookup (fixes P0.1)
+        task_to_node: Dict[asyncio.Task[Dict[str, Any]], str] = {
+            task: node_name for node_name, task in tasks.items()
+        }
 
-        for task in done:
-            # Find which node this task belongs to
-            task_node_name: Optional[str] = None
-            for name, t in tasks.items():
-                if t == task:
-                    task_node_name = name
-                    break
+        pending = set(tasks.values())
+        results = {}
+        errors = []
 
-            if task_node_name is None:
-                continue
+        # Wait for completions based on join strategy
+        num_to_wait = {
+            JoinStrategy.WAIT_ALL: len(group.nodes),
+            JoinStrategy.WAIT_ANY: 1,
+            JoinStrategy.WAIT_N: group.wait_n,
+        }[group.join_strategy]
 
-            result = task.result()
-            results[task_node_name] = {
-                "state": branch_states[task_node_name],
-                "events": result["events"],
-                "error": result["error"],
-            }
+        completed_count = 0
 
-            # Handle errors based on policy
-            if result["error"]:
-                errors.append((task_node_name, result["error"]))
+        while pending and completed_count < num_to_wait:
+            # Wait for next completion (FIRST_COMPLETED pattern)
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
 
-                if group.error_policy == ErrorPolicy.FAIL_FAST:
-                    # Cancel all pending tasks
-                    for p in pending:
-                        p.cancel()
+            for task in done:
+                # O(1) task lookup using inverse mapping (fixes P0.1)
+                task_node_name = task_to_node.get(task)
 
-                    raise result["error"]
+                if task_node_name is None:
+                    # Task not in mapping - critical error, should never happen
+                    logger.error(
+                        f"Task identity tracking failure: task {task} not found in"
+                        f" mapping. This indicates a critical bug."
+                    )
+                    span.set_attribute("parallel.task_lookup_failure", True)
+                    raise RuntimeError(
+                        f"Task {task} not found in task_to_node mapping. This should"
+                        " never happen and indicates a critical bug in parallel"
+                        " execution."
+                    )
 
-            # Yield events from completed node
-            for event in result["events"]:
-                yield event
+                logger.debug(f"Task for node '{task_node_name}' completed")
+                span.add_event(
+                    "task_completed",
+                    {
+                        "node_name": task_node_name,
+                        "completed_count": completed_count + 1,
+                    },
+                )
 
-            completed_count += 1
+                result = task.result()
+                results[task_node_name] = {
+                    "state": branch_states[task_node_name],
+                    "events": result["events"],
+                    "error": result["error"],
+                }
 
-    # Cancel remaining tasks if we satisfied join strategy
-    if pending:
-        for task in pending:
-            task.cancel()
+                # Handle errors based on policy
+                if result["error"]:
+                    errors.append((task_node_name, result["error"]))
+                    span.add_event(
+                        "task_error",
+                        {
+                            "node_name": task_node_name,
+                            "error": str(result["error"]),
+                            "error_policy": group.error_policy.value,
+                        },
+                    )
 
-        # Wait for cancellations
-        await asyncio.gather(*pending, return_exceptions=True)
+                    if group.error_policy == ErrorPolicy.FAIL_FAST:
+                        # Cancel all pending tasks
+                        for p in pending:
+                            p.cancel()
 
-    # Handle collected errors
-    if errors and group.error_policy == ErrorPolicy.COLLECT:
-        error_msg = f"Errors in parallel execution: {errors}"
-        raise Exception(error_msg)
+                        raise result["error"]
 
-    # Merge branch states back into main state
-    # Strategy: Last write wins for conflicting keys
-    for node_name, result in results.items():
-        branch_state = result["state"]
-        # Merge data keys
-        for key, value in branch_state.data.items():
-            state.data[key] = value
-        # Merge metadata keys
-        for key, value in branch_state.metadata.items():
-            state.metadata[key] = value
+                # Yield events from completed node
+                for event in result["events"]:
+                    yield event
 
-    logger.info(
-        f"Parallel group completed. {completed_count}/{len(group.nodes)} nodes"
-        f" finished. Merged state from {len(results)} branches."
-    )
+                completed_count += 1
+
+        # Cancel remaining tasks if we satisfied join strategy
+        if pending:
+            span.add_event(
+                "cancelling_pending_tasks",
+                {"pending_count": len(pending)},
+            )
+            for task in pending:
+                task.cancel()
+
+            # Wait for cancellations
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # Handle collected errors
+        if errors and group.error_policy == ErrorPolicy.COLLECT:
+            error_msg = f"Errors in parallel execution: {errors}"
+            span.set_attribute("parallel.collected_errors", len(errors))
+            raise Exception(error_msg)
+
+        # Merge branch states back into main state
+        # Strategy: Last write wins for conflicting keys
+        for node_name, result in results.items():
+            branch_state = result["state"]
+            # Merge data keys
+            for key, value in branch_state.data.items():
+                state.data[key] = value
+            # Merge metadata keys
+            for key, value in branch_state.metadata.items():
+                state.metadata[key] = value
+
+        span.set_attribute("parallel.completed_count", completed_count)
+        span.set_attribute("parallel.branches_merged", len(results))
+
+        logger.info(
+            f"Parallel group completed. {completed_count}/{len(group.nodes)} nodes"
+            f" finished. Merged state from {len(results)} branches."
+        )
