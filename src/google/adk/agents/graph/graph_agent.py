@@ -658,9 +658,16 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                             invocation_context=ctx,
                             metadata={},
                         )
-                        event = await self.before_node_callback(callback_ctx)
-                        if event:
-                            yield event
+                        try:
+                            event = await self.before_node_callback(callback_ctx)
+                            if event:
+                                yield event
+                        except Exception as e:
+                            logger.error(
+                                f"before_node_callback failed for node '{current_node_name}': {e}",
+                                exc_info=True,
+                            )
+                            # Continue execution despite callback error
 
                     # Check for BEFORE-node interrupt (validation timing)
                     if (
@@ -900,9 +907,16 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                             invocation_context=ctx,
                             metadata={"output": output},
                         )
-                        event = await self.after_node_callback(callback_ctx)
-                        if event:
-                            yield event
+                        try:
+                            event = await self.after_node_callback(callback_ctx)
+                            if event:
+                                yield event
+                        except Exception as e:
+                            logger.error(
+                                f"after_node_callback failed for node '{current_node_name}': {e}",
+                                exc_info=True,
+                            )
+                            # Continue execution despite callback error
 
                     # Emit graph metadata event for evaluation framework
                     # This will be captured in Invocation.intermediate_data by EvaluationGenerator

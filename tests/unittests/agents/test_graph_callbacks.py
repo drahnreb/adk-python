@@ -8,8 +8,11 @@ Tests callback-based observability and extensibility:
 """
 
 import pytest
-from typing import Optional
+from typing import AsyncGenerator, Optional
+from typing_extensions import override
 
+from google.adk.agents.base_agent import BaseAgent
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.graph import (
     GraphAgent,
     GraphNode,
@@ -23,15 +26,20 @@ from google.genai import types
 
 
 # Mock agent for testing
-class MockAgent:
-    def __init__(self, name: str, response: str = "mock"):
-        self.name = name
-        self.response = response
+class MockAgent(BaseAgent):
+    _response: str
 
-    async def run_async(self, ctx):
+    def __init__(self, name: str, response: str = "mock", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self._response = response
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
         yield Event(
             author=self.name,
-            content=types.Content(parts=[types.Part(text=self.response)]),
+            content=types.Content(parts=[types.Part(text=self._response)]),
         )
 
 
@@ -328,3 +336,238 @@ async def test_both_callbacks_invoked_in_order():
         "before_node_b",
         "after_node_b",
     ]
+
+
+@pytest.mark.asyncio
+async def test_before_callback_error_is_caught_and_graph_continues():
+    """Test that errors in before_node_callback are caught and graph continues."""
+    callback_invocations = []
+
+    async def failing_before_callback(ctx: NodeCallbackContext) -> Optional[Event]:
+        callback_invocations.append(ctx.node.name)
+        raise ValueError(f"Callback error for {ctx.node.name}")
+
+    graph = GraphAgent(name="test_graph", before_node_callback=failing_before_callback)
+    node_a = GraphNode(name="node_a", agent=MockAgent("agent_a", "output_a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent("agent_b", "output_b"))
+
+    graph.add_node(node_a).add_node(node_b)
+    graph.add_edge("node_a", "node_b")
+    graph.set_start("node_a").set_end("node_b")
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="test_app",
+        agent=graph,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    events = []
+    # Graph should complete despite callback errors
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test input")]),
+    ):
+        events.append(event)
+
+    # Callbacks were attempted for both nodes
+    assert len(callback_invocations) == 2
+    assert callback_invocations == ["node_a", "node_b"]
+
+    # Graph execution completed (node outputs present)
+    agent_events = [e for e in events if e.author in ["agent_a", "agent_b"]]
+    assert len(agent_events) == 2
+
+
+@pytest.mark.asyncio
+async def test_after_callback_error_is_caught_and_graph_continues():
+    """Test that errors in after_node_callback are caught and graph continues."""
+    callback_invocations = []
+
+    async def failing_after_callback(ctx: NodeCallbackContext) -> Optional[Event]:
+        callback_invocations.append(ctx.node.name)
+        raise RuntimeError(f"After callback error for {ctx.node.name}")
+
+    graph = GraphAgent(name="test_graph", after_node_callback=failing_after_callback)
+    node_a = GraphNode(name="node_a", agent=MockAgent("agent_a", "output_a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent("agent_b", "output_b"))
+
+    graph.add_node(node_a).add_node(node_b)
+    graph.add_edge("node_a", "node_b")
+    graph.set_start("node_a").set_end("node_b")
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="test_app",
+        agent=graph,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    events = []
+    # Graph should complete despite callback errors
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test input")]),
+    ):
+        events.append(event)
+
+    # Callbacks were attempted for both nodes
+    assert len(callback_invocations) == 2
+    assert callback_invocations == ["node_a", "node_b"]
+
+    # Graph execution completed
+    agent_events = [e for e in events if e.author in ["agent_a", "agent_b"]]
+    assert len(agent_events) == 2
+
+
+@pytest.mark.asyncio
+async def test_both_callbacks_error_graph_still_completes():
+    """Test that graph completes even when both callbacks raise errors."""
+    before_invocations = []
+    after_invocations = []
+
+    async def failing_before(ctx: NodeCallbackContext) -> Optional[Event]:
+        before_invocations.append(ctx.node.name)
+        raise ValueError("Before error")
+
+    async def failing_after(ctx: NodeCallbackContext) -> Optional[Event]:
+        after_invocations.append(ctx.node.name)
+        raise ValueError("After error")
+
+    graph = GraphAgent(
+        name="test_graph",
+        before_node_callback=failing_before,
+        after_node_callback=failing_after,
+    )
+    node_a = GraphNode(name="node_a", agent=MockAgent("agent_a", "output_a"))
+    graph.add_node(node_a)
+    graph.set_start("node_a").set_end("node_a")
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="test_app",
+        agent=graph,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    events = []
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test input")]),
+    ):
+        events.append(event)
+
+    # Both callbacks were attempted
+    assert len(before_invocations) == 1
+    assert len(after_invocations) == 1
+
+    # Graph execution still completed
+    agent_events = [e for e in events if e.author == "agent_a"]
+    assert len(agent_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_error_is_logged(caplog):
+    """Test that callback errors are logged with details."""
+    import logging
+
+    async def failing_callback(ctx: NodeCallbackContext) -> Optional[Event]:
+        raise ValueError("Intentional callback error")
+
+    graph = GraphAgent(name="test_graph", before_node_callback=failing_callback)
+    node_a = GraphNode(name="node_a", agent=MockAgent("agent_a"))
+    graph.add_node(node_a)
+    graph.set_start("node_a").set_end("node_a")
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="test_app",
+        agent=graph,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    with caplog.at_level(logging.ERROR):
+        async for _ in runner.run_async(
+            user_id="test_user",
+            session_id="test_session",
+            new_message=types.Content(role="user", parts=[types.Part(text="test input")]),
+        ):
+            pass
+
+    # Verify error was logged
+    assert len(caplog.records) > 0
+    error_logs = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_logs) == 1
+    assert "before_node_callback failed" in error_logs[0].message
+    assert "node_a" in error_logs[0].message
+    assert "Intentional callback error" in error_logs[0].message
+
+
+@pytest.mark.asyncio
+async def test_partial_callback_errors_do_not_affect_successful_callbacks():
+    """Test that errors in one node's callback don't affect other nodes."""
+    invocations = []
+
+    async def selective_failing_callback(ctx: NodeCallbackContext) -> Optional[Event]:
+        invocations.append(ctx.node.name)
+        if ctx.node.name == "node_a":
+            raise ValueError("Error for node_a")
+        # node_b succeeds
+        return Event(
+            author="callback",
+            content=types.Content(parts=[types.Part(text=f"Success: {ctx.node.name}")]),
+        )
+
+    graph = GraphAgent(name="test_graph", before_node_callback=selective_failing_callback)
+    node_a = GraphNode(name="node_a", agent=MockAgent("agent_a"))
+    node_b = GraphNode(name="node_b", agent=MockAgent("agent_b"))
+
+    graph.add_node(node_a).add_node(node_b)
+    graph.add_edge("node_a", "node_b")
+    graph.set_start("node_a").set_end("node_b")
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="test_app",
+        agent=graph,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="test_app", user_id="test_user", session_id="test_session"
+    )
+
+    events = []
+    async for event in runner.run_async(
+        user_id="test_user",
+        session_id="test_session",
+        new_message=types.Content(role="user", parts=[types.Part(text="test input")]),
+    ):
+        events.append(event)
+
+    # Both callbacks were attempted
+    assert invocations == ["node_a", "node_b"]
+
+    # Only node_b's callback event was emitted (node_a failed)
+    callback_events = [e for e in events if e.author == "callback"]
+    assert len(callback_events) == 1
+    assert "Success: node_b" in callback_events[0].content.parts[0].text
