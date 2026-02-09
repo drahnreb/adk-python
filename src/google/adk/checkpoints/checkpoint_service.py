@@ -7,14 +7,19 @@ This service provides checkpoint/resume capabilities using existing ADK primitiv
 The service is stateless - all checkpoint data is stored in session state.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import logging
 import time
 from typing import Any
 from typing import AsyncIterator
+from typing import Dict
 from typing import Optional
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from ..artifacts.base_artifact_service import BaseArtifactService
 from ..events.event import Event
@@ -108,6 +113,34 @@ class CheckpointService:
         self.artifact_service = artifact_service
         self.config = config or CheckpointServiceConfig()
 
+        # Per-session locks for P0.3 fix
+        self._session_locks: Dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()
+
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create lock for specific session (P0.3 fix).
+
+        Uses double-checked locking pattern for thread-safe lock acquisition.
+        Per-session locks ensure different sessions don't block each other.
+
+        Args:
+            session_id: Session ID to get lock for
+
+        Returns:
+            Lock for the session
+        """
+        # Fast path: lock exists
+        if session_id in self._session_locks:
+            return self._session_locks[session_id]
+
+        # Slow path: create lock with synchronization
+        async with self._locks_lock:
+            # Double-check: another coroutine may have created it
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = asyncio.Lock()
+                logger.debug(f"Created new checkpoint lock for session {session_id}")
+            return self._session_locks[session_id]
+
     @asynccontextmanager
     async def _traced(
         self, operation: str, checkpoint_id: str, session_id: str
@@ -173,136 +206,160 @@ class CheckpointService:
         if checkpoint_id is None:
             checkpoint_id = f"checkpoint-{uuid.uuid4()}"
 
-        async with self._traced("create", checkpoint_id, session.id):
-            # Validate checkpoint count limit
-            if self.config.max_checkpoints_per_session > 0:
-                checkpoint_index = session.state.get("_checkpoint_index", {})
-                current_count = len(checkpoint_index)
-                if current_count >= self.config.max_checkpoints_per_session:
-                    raise ValueError(
-                        f"Checkpoint limit reached: {current_count} checkpoints exist"
-                        f" (max: {self.config.max_checkpoints_per_session}). Delete old"
-                        " checkpoints or increase max_checkpoints_per_session limit."
-                    )
+        # Acquire per-session lock to prevent race conditions (P0.3 fix)
+        session_lock = await self._get_session_lock(session.id)
+        lock_start_time = time.time()
 
-            # Collect artifact versions if artifact service available
-            artifact_versions = {}
-            if self.artifact_service and session.app_name and session.user_id:
-                if artifact_filenames is None:
-                    # Track all artifacts in session
-                    artifact_filenames = await self.artifact_service.list_artifact_keys(
-                        app_name=session.app_name,
-                        user_id=session.user_id,
-                        session_id=session.id,
-                    )
+        async with session_lock:
+            lock_wait_ms = (time.time() - lock_start_time) * 1000
 
-                # Get current version for each artifact
-                for filename in artifact_filenames:
-                    versions = await self.artifact_service.list_versions(
-                        app_name=session.app_name,
-                        user_id=session.user_id,
-                        filename=filename,
-                        session_id=session.id,
-                    )
-                    if versions:
-                        artifact_versions[filename] = max(versions)
+            # Log high contention for monitoring
+            if lock_wait_ms > 100:
+                logger.warning(
+                    f"High lock contention for session {session.id}: "
+                    f"waited {lock_wait_ms:.2f}ms to acquire checkpoint lock"
+                )
 
-            # Compute state snapshot (delta or full)
-            state_snapshot = {}
-            base_checkpoint_id = None
+            async with self._traced("create", checkpoint_id, session.id):
+                # Record lock wait time in telemetry
+                with tracer.start_as_current_span("checkpoint.lock_wait") as span:
+                    span.set_attribute("checkpoint.lock_wait_ms", lock_wait_ms)
+                    span.set_attribute("checkpoint.session_id", session.id)
 
-            if use_delta:
-                # Get previous checkpoint to compute delta
-                checkpoint_index = session.state.get("_checkpoint_index", {})
-                if checkpoint_index:
-                    # Get most recent checkpoint
-                    sorted_ids = sorted(
-                        checkpoint_index.keys(),
-                        key=lambda cid: checkpoint_index[cid]["timestamp"],
-                        reverse=True,
-                    )
-                    if sorted_ids:
-                        base_checkpoint_id = sorted_ids[0]
-                        base_metadata = await self.get_checkpoint(
-                            session, base_checkpoint_id
+                # Validate checkpoint count limit (now synchronized)
+                if self.config.max_checkpoints_per_session > 0:
+                    checkpoint_index = session.state.get("_checkpoint_index", {})
+                    current_count = len(checkpoint_index)
+                    if current_count >= self.config.max_checkpoints_per_session:
+                        raise ValueError(
+                            f"Checkpoint limit reached: {current_count} checkpoints exist"
+                            f" (max: {self.config.max_checkpoints_per_session}). Delete old"
+                            " checkpoints or increase max_checkpoints_per_session limit."
                         )
-                        if base_metadata:
-                            prev_state = base_metadata.state_snapshot
-                            # Compute delta (only changed keys)
-                            for key, value in session.state.items():
-                                if key.startswith("_checkpoint"):
-                                    continue  # Skip checkpoint keys
-                                if key not in prev_state or prev_state[key] != value:
-                                    state_snapshot[key] = value
-                            # Track deleted keys
-                            for key in prev_state:
-                                if key not in session.state and not key.startswith(
-                                    "_checkpoint"
-                                ):
-                                    state_snapshot[key] = None  # Deletion marker
 
-            if not state_snapshot:  # Empty delta or full snapshot mode
-                # Full snapshot (filter out checkpoint keys)
-                state_snapshot = {
-                    k: v
-                    for k, v in session.state.items()
-                    if not k.startswith("_checkpoint")
+                # Collect artifact versions if artifact service available
+                artifact_versions = {}
+                if self.artifact_service and session.app_name and session.user_id:
+                    if artifact_filenames is None:
+                        # Track all artifacts in session
+                        artifact_filenames = (
+                            await self.artifact_service.list_artifact_keys(
+                                app_name=session.app_name,
+                                user_id=session.user_id,
+                                session_id=session.id,
+                            )
+                        )
+
+                    # Get current version for each artifact
+                    for filename in artifact_filenames:
+                        versions = await self.artifact_service.list_versions(
+                            app_name=session.app_name,
+                            user_id=session.user_id,
+                            filename=filename,
+                            session_id=session.id,
+                        )
+                        if versions:
+                            artifact_versions[filename] = max(versions)
+
+                # Compute state snapshot (delta or full)
+                state_snapshot = {}
+                base_checkpoint_id = None
+
+                if use_delta:
+                    # Get previous checkpoint to compute delta
+                    checkpoint_index = session.state.get("_checkpoint_index", {})
+                    if checkpoint_index:
+                        # Get most recent checkpoint
+                        sorted_ids = sorted(
+                            checkpoint_index.keys(),
+                            key=lambda cid: checkpoint_index[cid]["timestamp"],
+                            reverse=True,
+                        )
+                        if sorted_ids:
+                            base_checkpoint_id = sorted_ids[0]
+                            base_metadata = await self.get_checkpoint(
+                                session, base_checkpoint_id
+                            )
+                            if base_metadata:
+                                prev_state = base_metadata.state_snapshot
+                                # Compute delta (only changed keys)
+                                for key, value in session.state.items():
+                                    if key.startswith("_checkpoint"):
+                                        continue  # Skip checkpoint keys
+                                    if (
+                                        key not in prev_state
+                                        or prev_state[key] != value
+                                    ):
+                                        state_snapshot[key] = value
+                                # Track deleted keys
+                                for key in prev_state:
+                                    if key not in session.state and not key.startswith(
+                                        "_checkpoint"
+                                    ):
+                                        state_snapshot[key] = None  # Deletion marker
+
+                if not state_snapshot:  # Empty delta or full snapshot mode
+                    # Full snapshot (filter out checkpoint keys)
+                    state_snapshot = {
+                        k: v
+                        for k, v in session.state.items()
+                        if not k.startswith("_checkpoint")
+                    }
+
+                # Validate state size limit
+                if self.config.max_state_size_bytes > 0:
+                    state_size = len(json.dumps(state_snapshot).encode("utf-8"))
+                    if state_size > self.config.max_state_size_bytes:
+                        raise ValueError(
+                            f"State size {state_size} bytes exceeds limit"
+                            f" ({self.config.max_state_size_bytes} bytes). Consider using"
+                            " delta compression (use_delta=True) or reducing state size."
+                            f" Current state has {len(state_snapshot)} keys."
+                        )
+
+                # Create checkpoint metadata
+                metadata = CheckpointMetadata(
+                    checkpoint_id=checkpoint_id,
+                    description=description,
+                    agent_name=agent_name,
+                    artifact_versions=artifact_versions,
+                    state_snapshot=state_snapshot,
+                    is_delta=use_delta and base_checkpoint_id is not None,
+                    base_checkpoint_id=base_checkpoint_id,
+                    custom_metadata=custom_metadata or {},
+                )
+
+                # Update checkpoint index (O(1) lookups)
+                checkpoint_index = session.state.get("_checkpoint_index", {})
+                checkpoint_index[checkpoint_id] = {
+                    "timestamp": metadata.timestamp,
+                    "agent": agent_name,
                 }
 
-            # Validate state size limit
-            if self.config.max_state_size_bytes > 0:
-                state_size = len(json.dumps(state_snapshot).encode("utf-8"))
-                if state_size > self.config.max_state_size_bytes:
-                    raise ValueError(
-                        f"State size {state_size} bytes exceeds limit"
-                        f" ({self.config.max_state_size_bytes} bytes). Consider using"
-                        " delta compression (use_delta=True) or reducing state size."
-                        f" Current state has {len(state_snapshot)} keys."
-                    )
+                # Atomic operation: batch checkpoint + index in single event
+                checkpoint_event = Event(
+                    author=agent_name or "checkpoint_service",
+                    actions=EventActions(
+                        state_delta={
+                            f"_checkpoint_{checkpoint_id}": metadata.model_dump(),
+                            "_checkpoint_index": checkpoint_index,
+                        }
+                    ),
+                )
 
-            # Create checkpoint metadata
-            metadata = CheckpointMetadata(
-                checkpoint_id=checkpoint_id,
-                description=description,
-                agent_name=agent_name,
-                artifact_versions=artifact_versions,
-                state_snapshot=state_snapshot,
-                is_delta=use_delta and base_checkpoint_id is not None,
-                base_checkpoint_id=base_checkpoint_id,
-                custom_metadata=custom_metadata or {},
-            )
+                # Append to session (updates session.state automatically)
+                await self.session_service.append_event(session, checkpoint_event)
 
-            # Update checkpoint index (O(1) lookups)
-            checkpoint_index = session.state.get("_checkpoint_index", {})
-            checkpoint_index[checkpoint_id] = {
-                "timestamp": metadata.timestamp,
-                "agent": agent_name,
-            }
+                # Trace call
+                trace_checkpoint_create(
+                    checkpoint_id=checkpoint_id,
+                    session=session,
+                    agent_name=agent_name,
+                    description=description,
+                    artifact_count=len(artifact_versions),
+                )
 
-            # Atomic operation: batch checkpoint + index in single event
-            checkpoint_event = Event(
-                author=agent_name or "checkpoint_service",
-                actions=EventActions(
-                    state_delta={
-                        f"_checkpoint_{checkpoint_id}": metadata.model_dump(),
-                        "_checkpoint_index": checkpoint_index,
-                    }
-                ),
-            )
-
-            # Append to session (updates session.state automatically)
-            await self.session_service.append_event(session, checkpoint_event)
-
-            # Trace call
-            trace_checkpoint_create(
-                checkpoint_id=checkpoint_id,
-                session=session,
-                agent_name=agent_name,
-                description=description,
-                artifact_count=len(artifact_versions),
-            )
-
-            return metadata
+                return metadata
 
     async def get_checkpoint(
         self,
