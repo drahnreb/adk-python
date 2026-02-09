@@ -168,7 +168,7 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         description="Callback invoked when evaluating edge conditions",
     )
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
         name: str,
         description: str = "",
@@ -179,8 +179,8 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         before_node_callback: Optional[NodeCallback] = None,
         after_node_callback: Optional[NodeCallback] = None,
         on_edge_condition_callback: Optional[EdgeCallback] = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Initialize GraphAgent.
 
         Args:
@@ -477,9 +477,9 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
             rewind_before_invocation_id=invocation_id,
         )
 
-    async def _execute_node(  # type: ignore[no-untyped-def]
+    async def _execute_node(
         self, node: GraphNode, state: GraphState, ctx: InvocationContext
-    ):
+    ) -> AsyncGenerator[Event, None]:
         """Execute a single node and yield events, returns output via state update.
 
         Args:
@@ -1097,13 +1097,13 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
                     self.interrupt_service.unregister_session(ctx.session.id)
                 span.set_attribute("graph_agent.completed", True)
 
-    async def _process_interrupt_message(  # type: ignore[no-untyped-def]
+    async def _process_interrupt_message(
         self,
         message: InterruptMessage,
         state: GraphState,
         current_node_name: str,
         ctx: InvocationContext,
-    ):  # Returns: str | tuple[str, str]
+    ) -> str | Tuple[str, str]:
         """Process interrupt message using LLM reasoner if configured.
 
         Uses InterruptReasoner (if configured) to intelligently decide what action to take.
@@ -1165,9 +1165,9 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
         # Execute the interrupt action
         return await self._execute_interrupt_action(action_obj, state, ctx)
 
-    async def _execute_interrupt_action(  # type: ignore[no-untyped-def]
+    async def _execute_interrupt_action(
         self, action: InterruptAction, state: GraphState, ctx: InvocationContext
-    ):  # Returns: str | tuple[str, str]
+    ) -> str | Tuple[str, str]:
         """Execute interrupt action based on LLM reasoner decision.
 
         Args:
@@ -1363,7 +1363,7 @@ class GraphAgent(BaseAgent):  # type: ignore[misc]
 # ============================================================================
 
 
-async def example_react_pattern():  # type: ignore[no-untyped-def]  # pragma: no cover
+async def example_react_pattern() -> None:  # pragma: no cover
     """Example: Implement ReAct pattern (Reasoning + Acting) using GraphAgent.
 
     Flow:
@@ -1492,7 +1492,7 @@ async def example_react_pattern():  # type: ignore[no-untyped-def]  # pragma: no
 # ============================================================================
 
 
-async def example_multi_agent_graph():  # type: ignore[no-untyped-def]  # pragma: no cover
+def example_multi_agent_graph() -> GraphAgent:  # pragma: no cover
     """Example: Multi-agent research system with parallel execution and merging.
 
     Flow:

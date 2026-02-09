@@ -895,12 +895,13 @@ class TestExamples:
         # Just verify the function exists and is async
         assert asyncio.iscoroutinefunction(example_react_pattern)
 
-    async def test_example_multi_agent_graph_imports(self):
+    def test_example_multi_agent_graph_imports(self):
         """Test that example_multi_agent_graph can be imported and called."""
         from google.adk.agents.graph.graph_agent import example_multi_agent_graph
 
-        # Just verify the function exists and is async
-        assert asyncio.iscoroutinefunction(example_multi_agent_graph)
+        # Verify the function exists and is callable (sync function returns GraphAgent)
+        assert callable(example_multi_agent_graph)
+        assert not asyncio.iscoroutinefunction(example_multi_agent_graph)
 
 
 # ============================================================================
