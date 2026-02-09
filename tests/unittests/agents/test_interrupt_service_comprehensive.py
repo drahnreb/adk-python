@@ -54,12 +54,13 @@ class TestSessionManagement:
 
         assert service.is_active(session_id)
 
-    def test_context_manager(self):
+    @pytest.mark.asyncio
+    async def test_context_manager(self):
         """Test context manager properly registers/unregisters."""
         service = InterruptService()
         session_id = "test-session-1"
 
-        with service.session(session_id):
+        async with service.session(session_id):
             assert service.is_active(session_id)
 
         assert not service.is_active(session_id)
@@ -232,7 +233,7 @@ class TestCancellation:
 
         # Queue should be empty
         status = service.get_queue_status(session_id)
-        assert status.size == 0
+        assert status.queue_depth == 0
 
 
 class TestQueueManagement:
@@ -246,8 +247,8 @@ class TestQueueManagement:
 
         status = service.get_queue_status(session_id)
         assert status is not None
-        assert status.size == 0
-        assert status.max_size == 100  # default
+        assert status.queue_depth == 0
+        assert status.max_queue_size == 100  # default
 
     @pytest.mark.asyncio
     async def test_list_queued_messages(self):
@@ -266,7 +267,7 @@ class TestQueueManagement:
 
         # Messages should still be in queue
         status = service.get_queue_status(session_id)
-        assert status.size == 2
+        assert status.queue_depth == 2
 
     def test_clear_queue(self):
         """Test clear_queue removes all messages."""
@@ -286,7 +287,7 @@ class TestQueueManagement:
         assert cleared_count == 2
 
         status = service.get_queue_status(session_id)
-        assert status.size == 0
+        assert status.queue_depth == 0
 
 
 class TestSessionEviction:
@@ -302,7 +303,7 @@ class TestSessionEviction:
         service.register_session("session-3")
 
         # Evict to keep only 1
-        service.evict_oldest_sessions(max_to_keep=1)
+        service.evict_oldest_sessions(keep_count=1)
 
         # Only newest should remain
         assert service.is_active("session-3")
@@ -335,7 +336,7 @@ class TestValidation:
         """Test that invalid session ID format is rejected."""
         service = InterruptService()
 
-        with pytest.raises(ValueError, match="Session ID must be non-empty"):
+        with pytest.raises(ValueError, match="session_id must be a non-empty string"):
             service.register_session("")
 
     @pytest.mark.asyncio
@@ -345,13 +346,13 @@ class TestValidation:
         session_id = "test-session-1"
         service.register_session(session_id)
 
-        with pytest.raises(ValueError, match="Message text cannot be empty"):
+        with pytest.raises(ValueError, match="Message text must be a non-empty string"):
             await service.send_message(session_id=session_id, text="")
 
     @pytest.mark.asyncio
     async def test_message_text_too_long(self):
         """Test that oversized message text is rejected."""
-        config = InterruptServiceConfig(max_message_size=100)
+        config = InterruptServiceConfig(max_message_length=100)
         service = InterruptService(config)
         session_id = "test-session-1"
         service.register_session(session_id)
