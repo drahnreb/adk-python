@@ -13,6 +13,7 @@ Tests complete end-to-end interrupt workflows including:
 
 import asyncio
 import pytest
+from typing import AsyncGenerator
 from unittest.mock import AsyncMock, patch
 import json
 
@@ -39,16 +40,18 @@ from google.adk.checkpoints.checkpoint_service import (
     CheckpointServiceConfig,
 )
 from google.genai import types
+from typing_extensions import override
 
 
-# Mock agents for testing
+# Test agents (proper BaseAgent implementations per ADK guidelines)
 class MockAgent(BaseAgent):
-    """Mock agent for testing."""
+    """Test agent extending BaseAgent."""
 
     response: str = "mock"
     call_count: int = 0
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         self.call_count += 1
         yield Event(
             author=self.name,
@@ -62,7 +65,8 @@ class SlowMockAgent(BaseAgent):
     event_count: int = 5
     delay: float = 0.01
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         for i in range(self.event_count):
             await asyncio.sleep(self.delay)
             yield Event(
@@ -76,7 +80,8 @@ class ErrorAgent(BaseAgent):
 
     error_message: str = "Test error"
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         # Must be async generator - yield before raising
         if False:
             yield  # Make it a generator
@@ -93,7 +98,8 @@ class MockReasoner(InterruptReasoner):
         super().__init__(config, **kwargs)
         self.mock_decision_json = decision_json
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         response = json.dumps(self.mock_decision_json)
         yield Event(
             author=self.name,

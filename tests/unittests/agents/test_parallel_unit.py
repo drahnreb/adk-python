@@ -15,6 +15,7 @@ Tests parallel execution internals directly:
 import asyncio
 import pytest
 from copy import deepcopy
+from typing import AsyncGenerator
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 
 from google.genai import types
@@ -32,16 +33,18 @@ from google.adk.events.event import Event
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.sessions.session import Session
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from typing_extensions import override
 
 
-# Mock agents
+# Test agents (proper BaseAgent implementations per ADK guidelines)
 class SimpleAgent(BaseAgent):
     """Agent that yields one event."""
 
     output: str = "test"
     delay: float = 0.0
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         if self.delay > 0:
             await asyncio.sleep(self.delay)
         yield Event(
@@ -55,7 +58,8 @@ class MultiEventAgent(BaseAgent):
 
     num_events: int = 3
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         for i in range(self.num_events):
             yield Event(
                 author=self.name,
@@ -68,7 +72,8 @@ class ErrorProneAgent(BaseAgent):
 
     error_msg: str = "Test error"
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         if False:
             yield  # Make it async generator
         raise RuntimeError(self.error_msg)
@@ -80,7 +85,8 @@ class StateModifyingAgent(BaseAgent):
     key: str = "test"
     value: str = "modified"
 
-    async def run_async(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         # Simulate state modification (in real scenario would use state_delta)
         yield Event(
             author=self.name,
@@ -340,7 +346,8 @@ class TestStateIsolationAndMerging:
         class StateCheckingAgent(BaseAgent):
             check_value: str = ""
 
-            async def run_async(self, ctx):
+            @override
+            async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
                 # Check initial state value
                 initial_value = ctx.session.state.get("shared_key", "")
                 yield Event(

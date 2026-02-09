@@ -12,10 +12,12 @@ from google.adk.agents.base_agent import BaseAgent
 from google.adk.events.event import Event
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.agents.invocation_context import InvocationContext
 from google.genai import types
+from typing_extensions import override
 
 
-# Test Fixtures
+# Test Fixtures (proper BaseAgent implementations per ADK guidelines)
 
 
 class SimpleAgent(BaseAgent):
@@ -25,7 +27,8 @@ class SimpleAgent(BaseAgent):
         super().__init__(name=name)
         self._test_output = output
 
-    async def _run_async_impl(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         """Return test output."""
         yield Event(
             author=self.name,
@@ -41,7 +44,8 @@ class StatefulAgent(BaseAgent):
         self._state_key = state_key
         self._state_value = state_value
 
-    async def _run_async_impl(self, ctx):
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         """Modify state and return output."""
         ctx.session.state[self._state_key] = self._state_value
         yield Event(
