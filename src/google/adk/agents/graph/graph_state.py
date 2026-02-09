@@ -41,7 +41,7 @@ class GraphState(BaseModel):  # type: ignore[misc]
         ```
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     data: Dict[str, Any] = Field(
         default_factory=dict, description="Node outputs and intermediate results"
