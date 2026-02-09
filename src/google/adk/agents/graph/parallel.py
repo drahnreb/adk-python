@@ -273,19 +273,57 @@ async def execute_parallel_group(
             span.set_attribute("parallel.collected_errors", len(errors))
             raise Exception(error_msg)
 
-        # Merge branch states back into main state
-        # Strategy: Last write wins for conflicting keys
+        # Merge branch states back into main state with conflict detection
+        conflicts_detected = []
+        keys_merged = set()
+
         for node_name, result in results.items():
             branch_state = result["state"]
-            # Merge data keys
+
+            # Merge data keys with conflict detection
             for key, value in branch_state.data.items():
+                if key in state.data and key in keys_merged:
+                    # Conflict: Multiple branches modified same key
+                    conflicts_detected.append(
+                        {
+                            "key": key,
+                            "node": node_name,
+                            "existing_value": state.data[key],
+                            "new_value": value,
+                        }
+                    )
+                    logger.warning(
+                        f"State merge conflict detected: key '{key}' modified by "
+                        f"multiple parallel branches. Last write wins (node: {node_name})."
+                    )
+
                 state.data[key] = value
-            # Merge metadata keys
+                keys_merged.add(key)
+
+            # Merge metadata keys with conflict detection
             for key, value in branch_state.metadata.items():
+                if key in state.metadata and key in keys_merged:
+                    # Conflict: Multiple branches modified same metadata key
+                    logger.warning(
+                        f"Metadata merge conflict detected: key '{key}' modified by "
+                        f"multiple parallel branches. Last write wins (node: {node_name})."
+                    )
+
                 state.metadata[key] = value
+                keys_merged.add(key)
 
         span.set_attribute("parallel.completed_count", completed_count)
         span.set_attribute("parallel.branches_merged", len(results))
+        span.set_attribute("parallel.conflicts_detected", len(conflicts_detected))
+
+        if conflicts_detected:
+            span.add_event(
+                "state_merge_conflicts",
+                {
+                    "conflict_count": len(conflicts_detected),
+                    "conflicting_keys": [c["key"] for c in conflicts_detected],
+                },
+            )
 
         logger.info(
             f"Parallel group completed. {completed_count}/{len(group.nodes)} nodes"
