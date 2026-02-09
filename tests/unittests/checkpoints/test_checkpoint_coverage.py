@@ -327,13 +327,13 @@ class TestDeltaReconstruction:
         # Delete base checkpoint (breaks delta chain)
         await checkpoint_service.delete_checkpoint(session, "base")
 
-        # Try to reconstruct delta (should return None - broken chain)
-        full_meta = await checkpoint_service.get_checkpoint(
-            session, "delta", reconstruct_delta=True
-        )
+        # Try to reconstruct delta (should raise DeltaChainBrokenError - P0.4 fix)
+        from google.adk.checkpoints.models import DeltaChainBrokenError
 
-        # Broken chain should return None (can't reconstruct)
-        assert full_meta is None
+        with pytest.raises(DeltaChainBrokenError):
+            await checkpoint_service.get_checkpoint(
+                session, "delta", reconstruct_delta=True
+            )
 
     @pytest.mark.asyncio
     async def test_restore_delta_checkpoint(

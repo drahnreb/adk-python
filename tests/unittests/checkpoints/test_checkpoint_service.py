@@ -177,13 +177,15 @@ class TestCheckpointService:
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_checkpoint(self, checkpoint_service, session):
-        """Test retrieving a checkpoint that doesn't exist."""
-        checkpoint = await checkpoint_service.get_checkpoint(
-            session=session,
-            checkpoint_id="nonexistent",
-        )
+        """Test retrieving a checkpoint that doesn't exist raises CheckpointNotFoundError."""
+        from google.adk.checkpoints.models import CheckpointNotFoundError
 
-        assert checkpoint is None
+        # Should raise CheckpointNotFoundError (P0.4 fix)
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.get_checkpoint(
+                session=session,
+                checkpoint_id="nonexistent",
+            )
 
     @pytest.mark.asyncio
     async def test_list_checkpoints(self, checkpoint_service, session):
@@ -261,13 +263,15 @@ class TestCheckpointService:
 
     @pytest.mark.asyncio
     async def test_restore_nonexistent_checkpoint(self, checkpoint_service, session):
-        """Test restoring a checkpoint that doesn't exist."""
-        metadata = await checkpoint_service.restore_checkpoint(
-            session=session,
-            checkpoint_id="nonexistent",
-        )
+        """Test restoring a checkpoint that doesn't exist raises CheckpointNotFoundError."""
+        from google.adk.checkpoints.models import CheckpointNotFoundError
 
-        assert metadata is None
+        # Should raise CheckpointNotFoundError (P0.4 fix)
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.restore_checkpoint(
+                session=session,
+                checkpoint_id="nonexistent",
+            )
 
     @pytest.mark.asyncio
     async def test_delete_checkpoint(self, checkpoint_service, session):
@@ -292,12 +296,14 @@ class TestCheckpointService:
         )
         assert deleted is True
 
-        # Verify it's gone
-        checkpoint = await checkpoint_service.get_checkpoint(
-            session=session,
-            checkpoint_id="to_delete",
-        )
-        assert checkpoint is None
+        # Verify it's gone (should raise CheckpointNotFoundError - P0.4 fix)
+        from google.adk.checkpoints.models import CheckpointNotFoundError
+
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.get_checkpoint(
+                session=session,
+                checkpoint_id="to_delete",
+            )
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_checkpoint(self, checkpoint_service, session):
@@ -730,7 +736,9 @@ class TestCheckpointExceptions:
 
     @pytest.mark.asyncio
     async def test_get_checkpoint_with_corrupted_data(self, session_service):
-        """Test get_checkpoint handles corrupted checkpoint data."""
+        """Test get_checkpoint raises CheckpointCorruptedError for corrupted data."""
+        from google.adk.checkpoints.models import CheckpointCorruptedError
+
         checkpoint_service = CheckpointService(session_service=session_service)
 
         session = await session_service.create_session(
@@ -743,18 +751,15 @@ class TestCheckpointExceptions:
         # Manually add corrupted checkpoint data
         session.state["_checkpoint_corrupted"] = {"invalid": "data"}
 
-        # get_checkpoint should raise error for corrupted data
-        try:
-            metadata = await checkpoint_service.get_checkpoint(session, "corrupted")
-            # If it doesn't raise, it should return None or invalid metadata
-            assert metadata is None or not hasattr(metadata, "checkpoint_id")
-        except (ValueError, TypeError, KeyError):
-            # Expected exception for corrupted data
-            pass
+        # get_checkpoint should raise CheckpointCorruptedError (P0.4 fix)
+        with pytest.raises(CheckpointCorruptedError):
+            await checkpoint_service.get_checkpoint(session, "corrupted")
 
     @pytest.mark.asyncio
     async def test_restore_nonexistent_checkpoint(self, session_service):
-        """Test restoring nonexistent checkpoint returns None."""
+        """Test restoring nonexistent checkpoint raises CheckpointNotFoundError."""
+        from google.adk.checkpoints.models import CheckpointNotFoundError
+
         checkpoint_service = CheckpointService(session_service=session_service)
 
         session = await session_service.create_session(
@@ -764,9 +769,9 @@ class TestCheckpointExceptions:
             state={"data": "test"},
         )
 
-        # Restore nonexistent checkpoint
-        result = await checkpoint_service.restore_checkpoint(session, "nonexistent")
-        assert result is None
+        # Restore nonexistent checkpoint (P0.4 fix - raises exception)
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.restore_checkpoint(session, "nonexistent")
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_checkpoint(self, session_service):

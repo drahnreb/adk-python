@@ -154,8 +154,11 @@ class TestCheckpointCallback:
         # After should NOT create checkpoint
         await callback.after_agent(callback_context)
         after_id = f"{session.id}-{simple_agent.name}-after"
-        after_cp = await checkpoint_service.get_checkpoint(session, after_id)
-        assert after_cp is None
+        # Should raise CheckpointNotFoundError (P0.4 fix)
+        from google.adk.checkpoints.models import CheckpointNotFoundError
+
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.get_checkpoint(session, after_id)
 
     @pytest.mark.asyncio
     async def test_checkpoint_after_only(
@@ -179,8 +182,11 @@ class TestCheckpointCallback:
         # Before should NOT create checkpoint
         await callback.before_agent(callback_context)
         before_id = f"{session.id}-{simple_agent.name}-before"
-        before_cp = await checkpoint_service.get_checkpoint(session, before_id)
-        assert before_cp is None
+        # Should raise CheckpointNotFoundError (P0.4 fix)
+        from google.adk.checkpoints.models import CheckpointNotFoundError
+
+        with pytest.raises(CheckpointNotFoundError):
+            await checkpoint_service.get_checkpoint(session, before_id)
 
         # After should create checkpoint
         await callback.after_agent(callback_context)

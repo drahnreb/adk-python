@@ -32,7 +32,10 @@ from ..telemetry.checkpoint_tracing import trace_checkpoint_delete
 from ..telemetry.checkpoint_tracing import trace_checkpoint_list
 from ..telemetry.checkpoint_tracing import trace_checkpoint_restore
 from ..telemetry.checkpoint_tracing import tracer
+from .models import CheckpointCorruptedError
 from .models import CheckpointMetadata
+from .models import CheckpointNotFoundError
+from .models import DeltaChainBrokenError
 from .models import ListCheckpointsResponse
 
 
@@ -144,7 +147,7 @@ class CheckpointService:
     @asynccontextmanager
     async def _traced(
         self, operation: str, checkpoint_id: str, session_id: str
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[Any]:
         """Internal helper for tracing checkpoint operations with metrics."""
         start_time = time.time()
         with tracer.start_as_current_span(
@@ -154,9 +157,9 @@ class CheckpointService:
                 "checkpoint.id": checkpoint_id,
                 "checkpoint.session_id": session_id,
             },
-        ):
+        ) as span:
             try:
-                yield
+                yield span  # Yield span for P0.4 error telemetry
                 duration_ms = (time.time() - start_time) * 1000
                 record_checkpoint_metrics(operation, duration_ms, "success")
             except Exception:
@@ -220,7 +223,7 @@ class CheckpointService:
                     f"waited {lock_wait_ms:.2f}ms to acquire checkpoint lock"
                 )
 
-            async with self._traced("create", checkpoint_id, session.id):
+            async with self._traced("create", checkpoint_id, session.id) as _:
                 # Record lock wait time in telemetry
                 with tracer.start_as_current_span("checkpoint.lock_wait") as span:
                     span.set_attribute("checkpoint.lock_wait_ms", lock_wait_ms)
@@ -277,10 +280,10 @@ class CheckpointService:
                         )
                         if sorted_ids:
                             base_checkpoint_id = sorted_ids[0]
-                            base_metadata = await self.get_checkpoint(
-                                session, base_checkpoint_id
-                            )
-                            if base_metadata:
+                            try:
+                                base_metadata = await self.get_checkpoint(
+                                    session, base_checkpoint_id
+                                )
                                 prev_state = base_metadata.state_snapshot
                                 # Compute delta (only changed keys)
                                 for key, value in session.state.items():
@@ -297,6 +300,18 @@ class CheckpointService:
                                         "_checkpoint"
                                     ):
                                         state_snapshot[key] = None  # Deletion marker
+                            except (
+                                CheckpointNotFoundError,
+                                CheckpointCorruptedError,
+                            ) as e:
+                                # Base checkpoint not found or corrupted - fall back to full snapshot
+                                logger.warning(
+                                    f"Cannot compute delta: base checkpoint {base_checkpoint_id} "
+                                    f"unavailable ({type(e).__name__}). Using full snapshot instead."
+                                )
+                                base_checkpoint_id = (
+                                    None  # Reset to force full snapshot
+                                )
 
                 if not state_snapshot:  # Empty delta or full snapshot mode
                     # Full snapshot (filter out checkpoint keys)
@@ -366,7 +381,7 @@ class CheckpointService:
         session: Session,
         checkpoint_id: str,
         reconstruct_delta: bool = False,
-    ) -> Optional[CheckpointMetadata]:
+    ) -> CheckpointMetadata:
         """Retrieve checkpoint metadata from session state.
 
         Args:
@@ -375,45 +390,105 @@ class CheckpointService:
             reconstruct_delta: If True and checkpoint is delta, reconstruct full state
 
         Returns:
-            CheckpointMetadata if checkpoint exists, None otherwise
+            CheckpointMetadata with checkpoint data
+
+        Raises:
+            CheckpointNotFoundError: If checkpoint does not exist
+            DeltaChainBrokenError: If delta chain is broken (base checkpoint missing)
+            CheckpointCorruptedError: If checkpoint data is invalid
         """
-        async with self._traced("get", checkpoint_id, session.id):
+        async with self._traced("get", checkpoint_id, session.id) as span:
             checkpoint_key = f"_checkpoint_{checkpoint_id}"
             checkpoint_data = session.state.get(checkpoint_key)
 
             if checkpoint_data is None:
-                return None
+                # Checkpoint doesn't exist - raise specific error (P0.4 fix)
+                span.set_attribute("checkpoint.error", "not_found")
+                span.add_event(
+                    "checkpoint_not_found",
+                    {"checkpoint_id": checkpoint_id, "session_id": session.id},
+                )
+                logger.error(
+                    f"Checkpoint {checkpoint_id} not found in session {session.id}"
+                )
+                raise CheckpointNotFoundError(
+                    f"Checkpoint {checkpoint_id} not found in session {session.id}"
+                )
 
-            metadata = CheckpointMetadata(**checkpoint_data)
+            # Parse checkpoint metadata - catch corruption (P0.4 fix)
+            try:
+                metadata = CheckpointMetadata(**checkpoint_data)
+            except Exception as e:
+                # Checkpoint data is corrupted
+                span.set_attribute("checkpoint.error", "corrupted")
+                span.add_event(
+                    "checkpoint_corrupted",
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "session_id": session.id,
+                        "error": str(e),
+                    },
+                )
+                logger.error(
+                    f"Checkpoint {checkpoint_id} data is corrupted: {e}",
+                    exc_info=True,
+                )
+                raise CheckpointCorruptedError(
+                    f"Checkpoint {checkpoint_id} data is corrupted: {e}"
+                ) from e
 
             # Reconstruct full state from delta chain if requested
             if reconstruct_delta and metadata.is_delta and metadata.base_checkpoint_id:
-                # Load base checkpoint (recursively reconstruct if it's also a delta)
-                base_metadata = await self.get_checkpoint(
-                    session, metadata.base_checkpoint_id, reconstruct_delta=True
-                )
-
-                if base_metadata is None:
-                    # Base checkpoint was deleted - return None to signal corruption
-                    import logging
-
-                    logger = logging.getLogger("google_adk.checkpoints")
-                    logger.warning(
-                        f"Base checkpoint {metadata.base_checkpoint_id} not found "
-                        f"for delta checkpoint {checkpoint_id}. Delta chain is broken."
+                # Track delta reconstruction in telemetry
+                with tracer.start_as_current_span(
+                    "checkpoint.delta_reconstruction"
+                ) as delta_span:
+                    delta_span.set_attribute("checkpoint.checkpoint_id", checkpoint_id)
+                    delta_span.set_attribute(
+                        "checkpoint.base_checkpoint_id", metadata.base_checkpoint_id
                     )
-                    return None
 
-                # Reconstruct full state by applying delta on top of base
-                full_state = dict(base_metadata.state_snapshot)
-                for key, value in metadata.state_snapshot.items():
-                    if value is None:  # Deletion marker
-                        full_state.pop(key, None)
-                    else:
-                        full_state[key] = value
+                    # Load base checkpoint (recursively reconstruct if it's also a delta)
+                    try:
+                        base_metadata = await self.get_checkpoint(
+                            session, metadata.base_checkpoint_id, reconstruct_delta=True
+                        )
+                    except CheckpointNotFoundError as e:
+                        # Base checkpoint missing - delta chain is broken (P0.4 fix)
+                        delta_span.set_attribute("checkpoint.error", "chain_broken")
+                        delta_span.add_event(
+                            "delta_chain_broken",
+                            {
+                                "checkpoint_id": checkpoint_id,
+                                "base_checkpoint_id": metadata.base_checkpoint_id,
+                                "session_id": session.id,
+                            },
+                        )
+                        logger.error(
+                            f"Delta chain broken: base checkpoint "
+                            f"{metadata.base_checkpoint_id} not found for delta "
+                            f"checkpoint {checkpoint_id}. Cannot reconstruct full state."
+                        )
+                        raise DeltaChainBrokenError(
+                            f"Delta chain broken: base checkpoint "
+                            f"{metadata.base_checkpoint_id} not found for delta "
+                            f"checkpoint {checkpoint_id}"
+                        ) from e
 
-                # Return metadata with full state
-                metadata.state_snapshot = full_state
+                    # Reconstruct full state by applying delta on top of base
+                    full_state = dict(base_metadata.state_snapshot)
+                    for key, value in metadata.state_snapshot.items():
+                        if value is None:  # Deletion marker
+                            full_state.pop(key, None)
+                        else:
+                            full_state[key] = value
+
+                    # Return metadata with full state
+                    metadata.state_snapshot = full_state
+
+                    delta_span.set_attribute(
+                        "checkpoint.reconstructed_keys", len(full_state)
+                    )
 
             return metadata
 
@@ -445,7 +520,7 @@ class CheckpointService:
         if page_size < 1 or page_size > 1000:
             page_size = 50
 
-        async with self._traced("list", "list", session.id):
+        async with self._traced("list", "list", session.id) as _:
             # O(1) lookup from index
             checkpoint_index = session.state.get("_checkpoint_index", {})
 
@@ -465,9 +540,14 @@ class CheckpointService:
             # Fetch metadata for current page
             checkpoints = []
             for cid in paginated_ids:
-                metadata = await self.get_checkpoint(session, cid)
-                if metadata:
+                try:
+                    metadata = await self.get_checkpoint(session, cid)
                     checkpoints.append(metadata)
+                except (CheckpointNotFoundError, CheckpointCorruptedError) as e:
+                    # Skip corrupted/missing checkpoints in listing
+                    logger.warning(
+                        f"Skipping checkpoint {cid} in list: {type(e).__name__}"
+                    )
 
             # Build response
             response = ListCheckpointsResponse(
@@ -510,15 +590,19 @@ class CheckpointService:
             restore_artifacts: Whether to restore artifact versions
 
         Returns:
-            CheckpointMetadata if checkpoint exists, None otherwise
+            CheckpointMetadata with restored checkpoint data
+
+        Raises:
+            CheckpointNotFoundError: If checkpoint does not exist
+            DeltaChainBrokenError: If delta chain is broken
+            CheckpointCorruptedError: If checkpoint data is invalid
         """
-        async with self._traced("restore", checkpoint_id, session.id):
+        async with self._traced("restore", checkpoint_id, session.id) as _:
             # Get checkpoint metadata with delta reconstruction
+            # (raises exceptions on error - P0.4 fix)
             metadata = await self.get_checkpoint(
                 session, checkpoint_id, reconstruct_delta=True
             )
-            if metadata is None:
-                return None
 
             # Restore state via event (maintains event timeline)
             if restore_state:
@@ -593,7 +677,7 @@ class CheckpointService:
         Returns:
             True if checkpoint was deleted, False if not found
         """
-        async with self._traced("delete", checkpoint_id, session.id):
+        async with self._traced("delete", checkpoint_id, session.id) as _:
             checkpoint_key = f"_checkpoint_{checkpoint_id}"
 
             if checkpoint_key not in session.state:

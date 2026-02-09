@@ -11,7 +11,11 @@ from .callback import CheckpointCallback
 from .checkpoint_service import CheckpointService
 from .checkpoint_service import CheckpointServiceConfig
 from .mixins import CheckpointableMixin
+from .models import CheckpointError
 from .models import CheckpointMetadata
+from .models import CheckpointNotFoundError
+from .models import DeltaChainBrokenError
+from .models import CheckpointCorruptedError
 from .models import ListCheckpointsResponse
 from . import utils
 
@@ -22,5 +26,9 @@ __all__ = [
     "ListCheckpointsResponse",
     "CheckpointCallback",
     "CheckpointableMixin",
+    "CheckpointError",
+    "CheckpointNotFoundError",
+    "DeltaChainBrokenError",
+    "CheckpointCorruptedError",
     "utils",
 ]

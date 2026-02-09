@@ -9,6 +9,33 @@ from pydantic import BaseModel
 from pydantic import Field
 
 
+class CheckpointError(Exception):
+    """Base exception for checkpoint-related errors."""
+
+    pass
+
+
+class CheckpointNotFoundError(CheckpointError):
+    """Raised when a checkpoint does not exist in session state."""
+
+    pass
+
+
+class DeltaChainBrokenError(CheckpointError):
+    """Raised when a delta checkpoint's base checkpoint is missing.
+
+    This indicates the delta chain is broken and full state cannot be reconstructed.
+    """
+
+    pass
+
+
+class CheckpointCorruptedError(CheckpointError):
+    """Raised when checkpoint data is invalid or corrupted."""
+
+    pass
+
+
 class CheckpointMetadata(BaseModel):  # type: ignore[misc]
     """Metadata for a checkpoint.
 
