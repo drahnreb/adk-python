@@ -404,6 +404,13 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     """
     if node.agent is not None:
       return node.agent
+    from .patterns import DynamicNode
+    from .patterns import NestedGraphNode
+
+    if isinstance(node, NestedGraphNode):
+      return node.graph_agent
+    if isinstance(node, DynamicNode):
+      return node.fallback_agent
     return None
 
   def _register_node_agents(self, node: "GraphNode") -> None:
@@ -765,6 +772,21 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         else:  # pragma: no cover
           # Defensive: This should never happen due to GraphNode validation
           raise ValueError(f"Node {node.name} has no agent or function")
+
+        # Auto-parse structured output: when agent has output_schema,
+        # convert raw JSON text to dict so output_mapper/state stay typed.
+        if (
+            output is not None
+            and isinstance(output, str)
+            and node.agent is not None
+            and hasattr(node.agent, "output_schema")
+            and node.agent.output_schema
+        ):
+          from .state_utils import parse_state_value
+
+          parsed = parse_state_value(output, node.agent.output_schema)
+          if parsed is not None:
+            output = parsed.model_dump(exclude_none=True)
 
         # Store output for caller retrieval
         if output_holder is not None:

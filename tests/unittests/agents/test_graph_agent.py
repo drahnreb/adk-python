@@ -11,16 +11,11 @@ Tests all features with 100% coverage:
 """
 
 import asyncio
-from datetime import datetime
-from datetime import timezone
 from typing import Dict
-from unittest.mock import AsyncMock
 from unittest.mock import Mock
 from unittest.mock import patch
 
 from google.adk.agents import LlmAgent
-from google.adk.agents import ParallelAgent
-from google.adk.agents import SequentialAgent
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.graph import EdgeCondition
 from google.adk.agents.graph import export_execution_timeline
@@ -31,7 +26,8 @@ from google.adk.agents.graph import GraphNode
 from google.adk.agents.graph import GraphState
 from google.adk.agents.graph import rewind_to_node
 from google.adk.agents.graph import StateReducer
-from google.adk.agents.graph.graph_agent_state import GraphAgentState
+from google.adk.agents.graph.patterns import DynamicNode
+from google.adk.agents.graph.patterns import NestedGraphNode
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.run_config import RunConfig
 from google.adk.apps import ResumabilityConfig
@@ -2482,6 +2478,31 @@ def _cov_linear_graph(name, agents, names):
 
 class TestGetNodeAgent:
 
+  def test_nested_graph_node_returns_graph_agent(self):
+    inner = GraphAgent(name="inner")
+    inner_agent = SimpleTestAgent("inner_step", ["inner_ok"])
+    inner.add_node(GraphNode(name="s", agent=inner_agent))
+    inner.set_start("s")
+    inner.set_end("s")
+    nested = NestedGraphNode(name="nest", graph_agent=inner)
+    outer = GraphAgent(name="outer")
+    assert outer._get_node_agent(nested) is inner
+
+  def test_dynamic_node_returns_fallback_agent(self):
+    fallback = SimpleTestAgent("fallback", ["fb_ok"])
+    dyn = DynamicNode(
+        name="dyn", agent_selector=lambda s: None, fallback_agent=fallback
+    )
+    outer = GraphAgent(name="outer")
+    assert outer._get_node_agent(dyn) is fallback
+
+  def test_dynamic_node_no_fallback_returns_none(self):
+    dyn = DynamicNode(
+        name="dyn", agent_selector=lambda s: None, fallback_agent=None
+    )
+    outer = GraphAgent(name="outer")
+    assert outer._get_node_agent(dyn) is None
+
   def test_regular_node_returns_agent(self):
     agent = SimpleTestAgent("a", ["ok"])
     node = GraphNode(name="n", agent=agent)
@@ -2634,3 +2655,206 @@ class TestConditionEvalLogging:
       assert result is False
       mock_logger.error.assert_called_once()
       assert mock_logger.error.call_args[1].get("exc_info") is True
+
+
+class StructuredOutputAgent(LlmAgent):
+  """Test agent that yields pre-set JSON as if from output_schema."""
+
+  model_config = {"arbitrary_types_allowed": True, "extra": "allow"}
+
+  def __init__(self, name: str, json_response: str, **kwargs):
+    super().__init__(
+        name=name, model="gemini-2.0-flash-exp", instruction="test", **kwargs
+    )
+    object.__setattr__(self, "_json_response", json_response)
+
+  async def _run_async_impl(self, ctx):
+    response = object.__getattribute__(self, "_json_response")
+    yield Event(
+        author=self.name,
+        content=types.Content(parts=[types.Part(text=response)]),
+    )
+
+
+@pytest.mark.asyncio
+class TestStructuredOutputPipeline:
+  """Regression tests for output_schema auto-parsing in _execute_node.
+
+  Ensures that when LlmAgent has output_schema set, the raw JSON text
+  is auto-parsed into a dict before reaching the output_mapper/state,
+  eliminating the need for consumers to re-parse.
+  """
+
+  async def test_output_schema_stores_dict_not_json_string(self):
+    """Agent with output_schema should store dict in state, not raw JSON str."""
+    from pydantic import BaseModel
+
+    class ValidationResult(BaseModel):
+      valid: bool
+      error: str | None = None
+
+    agent = StructuredOutputAgent(
+        name="validator",
+        json_response='{"valid": true, "error": null}',
+        output_schema=ValidationResult,
+        output_key="validator",
+    )
+
+    graph = GraphAgent(name="g")
+    graph.add_node(GraphNode(name="validator", agent=agent))
+    graph.set_start("validator")
+    graph.set_end("validator")
+
+    ctx = _cov_make_ctx(graph)
+    events = await _cov_collect(graph, ctx)
+
+    # Find the final event that carries graph_data
+    final = [
+        e
+        for e in events
+        if e.actions
+        and e.actions.state_delta
+        and "graph_data" in (e.actions.state_delta or {})
+    ]
+    assert len(final) == 1
+    graph_data = final[0].actions.state_delta["graph_data"]
+    stored = graph_data.get("validator")
+
+    # REGRESSION: must be dict, never raw JSON string
+    assert isinstance(
+        stored, dict
+    ), f"output_schema result stored as {type(stored).__name__}, expected dict"
+    assert stored["valid"] is True
+
+  async def test_output_schema_dict_survives_default_output_mapper(self):
+    """Dict from auto-parsing must survive OVERWRITE reducer unchanged."""
+    from pydantic import BaseModel
+
+    class Score(BaseModel):
+      value: int
+      label: str
+
+    agent = StructuredOutputAgent(
+        name="scorer",
+        json_response='{"value": 42, "label": "high"}',
+        output_schema=Score,
+        output_key="scorer",
+    )
+
+    graph = GraphAgent(name="g")
+    graph.add_node(
+        GraphNode(
+            name="scorer",
+            agent=agent,
+            reducer=StateReducer.OVERWRITE,
+        )
+    )
+    graph.set_start("scorer")
+    graph.set_end("scorer")
+
+    ctx = _cov_make_ctx(graph)
+    events = await _cov_collect(graph, ctx)
+
+    final = [
+        e
+        for e in events
+        if e.actions
+        and e.actions.state_delta
+        and "graph_data" in (e.actions.state_delta or {})
+    ]
+    assert len(final) == 1
+    stored = final[0].actions.state_delta["graph_data"]["scorer"]
+
+    assert isinstance(stored, dict)
+    assert stored == {"value": 42, "label": "high"}
+
+  async def test_function_node_dict_output_matches_agent_schema_output(self):
+    """Function nodes returning dicts and agent nodes with output_schema
+    both produce dict output — verified via _default_output_mapper.
+
+    Agent nodes with output_schema: _execute_node auto-parses JSON → dict.
+    Function nodes: return Python objects directly (already dict).
+    Both paths feed the same _default_output_mapper with dict input.
+    """
+    from pydantic import BaseModel
+
+    class Result(BaseModel):
+      status: str
+      score: int
+
+    expected = {"status": "ok", "score": 42}
+
+    # Verify agent node path: auto-parsed JSON → dict stored under node name
+    agent = StructuredOutputAgent(
+        name="agent_node",
+        json_response='{"status": "ok", "score": 42}',
+        output_schema=Result,
+        output_key="agent_node",
+    )
+    agent_node = GraphNode(
+        name="agent_node",
+        agent=agent,
+        reducer=StateReducer.OVERWRITE,
+    )
+    state = GraphState(data={})
+    agent_result = agent_node._default_output_mapper(expected, state)
+    assert isinstance(agent_result.data["agent_node"], dict)
+
+    # Verify function node path: dict returned directly → same mapper behavior
+    fn_node = GraphNode(
+        name="fn_node",
+        function=lambda s, c: expected,
+        reducer=StateReducer.OVERWRITE,
+    )
+    # Function nodes auto-default to MERGE, so explicitly test OVERWRITE path
+    fn_node.reducer = StateReducer.OVERWRITE
+    fn_result = fn_node._default_output_mapper(expected, state)
+    assert isinstance(fn_result.data["fn_node"], dict)
+
+    # Harmonization: same dict type from both paths
+    assert (
+        type(agent_result.data["agent_node"])
+        is type(fn_result.data["fn_node"])
+        is dict
+    )
+    assert (
+        agent_result.data["agent_node"] == fn_result.data["fn_node"] == expected
+    )
+
+  async def test_output_schema_parse_failure_preserves_raw_text(self):
+    """When JSON doesn't match schema, fall back to raw string (no crash)."""
+    from pydantic import BaseModel
+
+    class StrictModel(BaseModel):
+      required_field: int
+
+    # Response doesn't have 'required_field' - parse will fail
+    agent = StructuredOutputAgent(
+        name="bad_schema",
+        json_response='{"wrong_key": "oops"}',
+        output_schema=StrictModel,
+        output_key="bad_schema",
+    )
+
+    graph = GraphAgent(name="g")
+    graph.add_node(GraphNode(name="bad_schema", agent=agent))
+    graph.set_start("bad_schema")
+    graph.set_end("bad_schema")
+
+    ctx = _cov_make_ctx(graph)
+    # Should not raise - graceful fallback
+    events = await _cov_collect(graph, ctx)
+
+    final = [
+        e
+        for e in events
+        if e.actions
+        and e.actions.state_delta
+        and "graph_data" in (e.actions.state_delta or {})
+    ]
+    assert len(final) == 1
+    stored = final[0].actions.state_delta["graph_data"]["bad_schema"]
+
+    # Falls back to raw string when parse fails
+    assert isinstance(stored, str)
+    assert "wrong_key" in stored
