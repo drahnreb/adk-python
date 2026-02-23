@@ -7,17 +7,42 @@ GraphAgent enables workflow creation using directed graphs where:
 - Nodes are agents or functions
 - Edges define allowed transitions with optional conditions
 - State flows through the graph with configurable reducers
+- Full checkpointing support via CheckpointService integration
 
 Key features:
 - Directed graph workflows with conditional routing
 - State management with custom reducers (OVERWRITE, APPEND, SUM, CUSTOM)
 - Always-on observability: node lifecycle events for every execution
+- Human-in-the-loop interrupts via InterruptService (retrospective feedback)
+- CheckpointService integration for checkpoint/resume
 - DatabaseSessionService support for persistence
 - Cyclic execution with max_iterations
 - Event-based state persistence (ADK-native)
-- ADK resumability integration (pause/resume long-running workflows)
 
 Inspired by adk-graph (Rust) and LangGraph patterns.
+
+Checkpointing Integration:
+    For checkpoint/resume functionality, use CheckpointService with CheckpointCallback:
+
+    ```python
+    from google.adk.agents.graph import GraphAgent
+    from google.adk.checkpoints import CheckpointService, CheckpointCallback
+    from google.adk.sessions import InMemorySessionService
+
+    # Create services
+    session_service = InMemorySessionService()
+    checkpoint_service = CheckpointService(session_service)
+
+    # Create graph with checkpoint callback
+    graph = GraphAgent(name="workflow", checkpointing=True)
+    graph.add_node(...)
+    graph.set_callbacks([
+        CheckpointCallback(checkpoint_service, checkpoint_after=True)
+    ])
+
+    # Checkpoints are created automatically after each node
+    # Use checkpoint_service to list/delete/export/import checkpoints
+    ```
 """
 
 from __future__ import annotations
@@ -29,6 +54,7 @@ import time
 from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
+from typing import ClassVar
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -46,21 +72,28 @@ from ...telemetry import graph_tracing
 from ...telemetry.tracing import tracer
 from ...utils.feature_decorator import experimental
 from ..base_agent import BaseAgent
+from ..base_agent_config import BaseAgentConfig
 from ..invocation_context import InvocationContext
 from ..llm_agent import LlmAgent
 from .callbacks import EdgeCallback
 from .callbacks import NodeCallback
 from .graph_agent_state import GraphAgentState
 from .graph_edge import EdgeCondition
+from .graph_interrupt_handler import GraphInterruptMixin
 from .graph_node import GraphNode
 from .graph_state import GraphState
 from .graph_state import StateReducer
 from .graph_telemetry import GraphTelemetryMixin
+from .interrupt import InterruptConfig
+from .interrupt import InterruptMode
+from .interrupt_service import InterruptService
 from .parallel import execute_parallel_group
 from .parallel import ParallelNodeGroup
 
 if TYPE_CHECKING:
   from .graph_agent_config import TelemetryConfig
+
+from .graph_agent_config import GraphAgentConfig
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -82,9 +115,15 @@ _GRAPH_INTERNAL_KEYS = frozenset({
 })
 
 
+# SECURITY: These whitelists define the sandbox for YAML edge conditions
+# evaluated via eval(). Additions MUST be reviewed for sandbox escape.
+# NEVER add: exec, eval, compile, __import__, getattr, setattr, delattr,
+# globals, locals, vars, dir, open, input, breakpoint, or any function
+# providing code execution / filesystem / network access.
 _SAFE_NAMES = frozenset({
     "state",
     "data",
+    "metadata",
     "True",
     "False",
     "None",
@@ -95,6 +134,9 @@ _SAFE_METHODS = frozenset({
     "get_str",
     "get_dict",
 })
+# SECURITY: Sandbox whitelist for YAML edge conditions evaluated via eval().
+# NEVER add: type, exec, eval, compile, __import__, getattr, setattr,
+# delattr, globals, locals, vars, dir, open, input, breakpoint.
 _SAFE_BUILTINS = frozenset({
     "len",
     "min",
@@ -105,7 +147,6 @@ _SAFE_BUILTINS = frozenset({
     "float",
     "str",
     "isinstance",
-    "type",
 })
 
 
@@ -146,10 +187,11 @@ def _validate_condition_ast(node: ast.AST) -> None:
     for kw in node.keywords:
       _validate_condition_ast(kw.value)
   elif isinstance(node, ast.Attribute):
-    # Block dunder attribute access to prevent sandbox escape
-    # (e.g., state.__class__.__init__.__globals__)
-    if node.attr.startswith("_"):
-      raise ValueError(f"Unsafe attribute access: '{node.attr}'")
+    # Only block dunder attrs (__class__, __init__, etc.) — these enable
+    # sandbox escape chains. Single-underscore attrs are safe: dict has none,
+    # and GraphState exposes no private fields to condition expressions.
+    if node.attr.startswith("__") and node.attr.endswith("__"):
+      raise ValueError(f"Unsafe dunder attribute access: '{node.attr}'")
     _validate_condition_ast(node.value)
   elif isinstance(node, ast.Subscript):
     _validate_condition_ast(node.value)
@@ -162,6 +204,12 @@ def _validate_condition_ast(node: ast.AST) -> None:
   elif isinstance(node, (ast.List, ast.Tuple)):
     for elt in node.elts:
       _validate_condition_ast(elt)
+  elif isinstance(node, ast.Dict):
+    for key in node.keys:
+      if key is not None:
+        _validate_condition_ast(key)
+    for value in node.values:
+      _validate_condition_ast(value)
   else:
     raise ValueError(f"Unsafe expression node: {type(node).__name__}")
 
@@ -176,7 +224,7 @@ def _parse_condition_string(condition_str: str) -> Callable[[GraphState], bool]:
   Allowed in conditions:
   - Names: state, data, metadata, True, False, None
   - Methods: .get(), .get_parsed(), .get_str(), .get_dict()
-  - Builtins: len, min, max, abs, bool, int, float, str, isinstance, type
+  - Builtins: len, min, max, abs, bool, int, float, str, isinstance
   - Operators: ==, !=, <, >, <=, >=, is, is not, in, not in
   - Boolean: and, or, not
   - Literals: strings, numbers, booleans, None
@@ -209,11 +257,15 @@ def _parse_condition_string(condition_str: str) -> Callable[[GraphState], bool]:
     namespace = {
         "state": state,
         "data": state.data,
+        "metadata": state.data,
     }
     try:
       result = eval(code, {"__builtins__": safe_builtins}, namespace)  # noqa: S307
       return bool(result)
     except Exception as e:
+      # By design: condition errors → False (don't route). Crashing the
+      # graph on a missing key or type mismatch is worse than skipping
+      # one edge. Errors are logged for debugging.
       logger.error(
           f"Condition evaluation failed: '{condition_str}' - {e}",
           exc_info=True,
@@ -229,12 +281,12 @@ END = "__end__"
 
 
 @experimental
-class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
+class GraphAgent(GraphInterruptMixin, GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
   """Graph-based workflow agent for ADK.
 
   GraphAgent is the fourth workflow agent type in ADK (alongside SequentialAgent,
   LoopAgent, and ParallelAgent), enabling directed graph-based orchestration with
-  conditional routing and state management.
+  conditional routing, state management, and full checkpointing support.
 
   Workflow agents control execution flow through deterministic logic rather than LLM
   reasoning, providing predictable, reliable, and structured agent orchestration.
@@ -244,28 +296,47 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
   - Conditional routing based on state predicates
   - Cyclic execution support (loops, iterative refinement, ReAct pattern)
   - Always-on observability: node lifecycle events emitted for every execution
+  - Human-in-the-loop interrupts via InterruptService (retrospective feedback)
+  - CheckpointService integration for state persistence
   - DatabaseSessionService support for persistence
   - Full ADK event system integration
-  - ADK resumability (pause/resume via agent state)
 
   Example:
       >>> from google.adk.agents.graph import GraphAgent, GraphNode
       >>> from google.adk.agents import LlmAgent
+      >>> from google.adk.checkpoints import CheckpointService, CheckpointCallback
       >>> from google.adk.runners import Runner
       >>>
-      >>> graph = GraphAgent(name="workflow")
+      >>> # Selective node-level checkpointing (only critical nodes)
+      >>> checkpoint_service = CheckpointService(session_service)
+      >>> checkpoint_cb = CheckpointCallback(
+      ...     checkpoint_service,
+      ...     checkpoint_before=False,
+      ...     checkpoint_after=True,
+      ...     checkpoint_nodes={"analyze", "process"},  # only these nodes
+      ... )
+      >>>
+      >>> graph = GraphAgent(
+      ...     name="workflow",
+      ...     after_node_callback=checkpoint_cb.after_node,
+      ... )
       >>> graph.add_node(GraphNode(name="analyze", agent=LlmAgent(...)))
       >>> graph.add_node(GraphNode(name="process", agent=LlmAgent(...)))
       >>> graph.add_edge("analyze", "process")
       >>> graph.set_start("analyze")
       >>> graph.set_end("process")
       >>>
+      >>> # Run with automatic checkpointing at critical nodes
       >>> runner = Runner(app_name="app", agent=graph)
       >>> async for event in runner.run_async(...):
       ...     print(event)
+      >>>
+      >>> # Legacy: checkpoint after EVERY node (all-or-nothing)
+      >>> graph_legacy = GraphAgent(name="workflow", checkpointing=True)
   """
 
   model_config = ConfigDict(arbitrary_types_allowed=True)
+  config_type: ClassVar[type[BaseAgentConfig]] = GraphAgentConfig
 
   nodes: Dict[str, GraphNode] = Field(default_factory=dict)
   start_node: Optional[str] = None
@@ -275,6 +346,14 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
   parallel_groups: Dict[str, Any] = Field(
       default_factory=dict,
       description="Parallel node groups for concurrent execution",
+  )
+  interrupt_service: Optional[InterruptService] = Field(
+      default=None,
+      description="Optional InterruptService for dynamic runtime interrupts",
+  )
+  interrupt_config: Optional[InterruptConfig] = Field(
+      default=None,
+      description="Configuration for interrupt timing and behavior",
   )
   telemetry_config: Optional[Any] = Field(
       default=None,
@@ -299,6 +378,8 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
       description: str = "",
       max_iterations: int = 50,
       checkpointing: bool = False,
+      interrupt_service: Optional[InterruptService] = None,
+      interrupt_config: Optional[InterruptConfig] = None,
       telemetry_config: Optional[Any] = None,
       before_node_callback: Optional[NodeCallback] = None,
       after_node_callback: Optional[NodeCallback] = None,
@@ -312,6 +393,9 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         description: Agent description
         max_iterations: Max iterations to prevent infinite loops
         checkpointing: Enable state checkpointing after each node
+            Note: For full checkpoint/resume, use CheckpointCallback
+        interrupt_service: Optional InterruptService for dynamic runtime interrupts
+        interrupt_config: Configuration for interrupt timing and behavior
         telemetry_config: Configuration for OpenTelemetry instrumentation
         before_node_callback: Callback invoked before each node execution
         after_node_callback: Callback invoked after each node execution
@@ -322,11 +406,14 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     self.start_node = None
     self.end_nodes = []
     self.max_iterations = max_iterations
+    self.interrupt_service = interrupt_service
+    self.interrupt_config = interrupt_config
     self.telemetry_config = telemetry_config
     self.before_node_callback = before_node_callback
     self.after_node_callback = after_node_callback
     self.on_edge_condition_callback = on_edge_condition_callback
     self.checkpointing = checkpointing
+    # parallel_groups initialized by Field default_factory
 
   def add_node(
       self,
@@ -346,6 +433,12 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         agent: Optional agent for convenience pattern
         function: Optional function for convenience pattern
         **kwargs: Additional GraphNode parameters (output_mapper, state_reducer, etc.)
+
+    Note: Both agent and function nodes produce flat state.data entries,
+        following ADK's output_key convention. Agent nodes default to
+        OVERWRITE (output stored at state.data[node_name], like output_key).
+        Function nodes default to MERGE (dict returns spread as top-level
+        keys in state.data). Pass reducer= to override either default.
 
     Returns:
         Self for chaining
@@ -691,15 +784,34 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
 
     Raises:
         ValueError: If nodes in group not found
+
+    Example:
+        >>> from google.adk.agents.graph import ParallelNodeGroup, JoinStrategy
+        >>> graph.add_parallel_group(
+        ...     "fetch_group",
+        ...     ParallelNodeGroup(
+        ...         nodes=["fetch_user", "fetch_products"],
+        ...         join_strategy=JoinStrategy.WAIT_ALL
+        ...     )
+        ... )
     """
+    # Validate all nodes exist
     for node_name in group.nodes:
       if node_name not in self.nodes:
         raise ValueError(f"Node {node_name} not found in graph")
+
     self.parallel_groups[group_id] = group
     return self
 
   def _find_parallel_group(self, node_name: str) -> Optional[Tuple[str, Any]]:
-    """Find if a node is part of a parallel group."""
+    """Find if a node is part of a parallel group.
+
+    Args:
+        node_name: Node name to check
+
+    Returns:
+        Tuple of (group_id, ParallelNodeGroup) if found, None otherwise
+    """
     for group_id, group in self.parallel_groups.items():
       if node_name in group.nodes:
         return (group_id, group)
@@ -775,7 +887,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
           )
 
         # Execute node (agent or function)
-        output = ""
+        output = None
         if node.agent:
           # Create new context with updated user_content for this node
           node_content = types.Content(
@@ -788,7 +900,9 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
           async for event in node.agent.run_async(node_ctx):
             # Extract output from final response
             if event.content and event.content.parts:
-              output = event.content.parts[0].text or ""
+              text_parts = [part.text for part in event.content.parts]
+              if any(part is not None for part in text_parts):
+                output = "\n".join(part or "" for part in text_parts)
             yield event
             # ADK resumability: pause when long-running tool detected.
             # Function nodes don't set "pause" (they run synchronously,
@@ -854,6 +968,8 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
               success=False,
           )
         raise
+
+  # _check_interrupt_with_telemetry inherited from GraphInterruptMixin
 
   def _get_next_node_with_telemetry(
       self,
@@ -979,8 +1095,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
           },
       )
 
-    next_node: Optional[str] = selected_node
-    return next_node
+    return selected_node
 
   def _get_resume_state(
       self, agent_state: GraphAgentState
@@ -1106,8 +1221,9 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
       current_node_name: str,
       state: GraphState,
       ctx: InvocationContext,
-      output: str,
+      output: Any,
       effective_config: Optional["TelemetryConfig"] = None,
+      agent_state: Optional[GraphAgentState] = None,
   ) -> GraphState:
     """Sync session state into GraphState and apply output_mapper + reducer.
 
@@ -1118,6 +1234,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         ctx: Invocation context
         output: Node output string
         effective_config: Effective telemetry config
+        agent_state: Execution tracking state for output key tracking
 
     Returns:
         Updated GraphState after sync and reduction
@@ -1128,14 +1245,29 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         state.data[_sk] = _sv
 
     # Apply output mapper with reducer
-    if output:
+    if output is not None:
       had_previous_value = current_node.name in state.data
       reducer_start = time.time()
+
+      # Snapshot keys before output_mapper to track what gets written
+      keys_before = set(state.data.keys())
 
       prev_state = state
       state = current_node.output_mapper(output, state)
       if state is None:
         state = prev_state
+
+      # Track which keys were written by this node's output_mapper
+      if agent_state is not None:
+        keys_after = set(state.data.keys())
+        written_keys = list(keys_after - keys_before)
+        # Also include the node name key if it was overwritten
+        if (
+            current_node_name in state.data
+            and current_node_name not in written_keys
+        ):
+          written_keys.append(current_node_name)
+        agent_state.output_keys[current_node_name] = written_keys
 
       reducer_latency_ms = (time.time() - reducer_start) * 1000
       if self._should_sample(effective_config=effective_config):
@@ -1171,6 +1303,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
       message: str,
       iteration: Optional[int] = None,
       partial_output: Optional[str] = None,
+      path: Optional[List[str]] = None,
   ) -> List[Event]:
     """Build agent-state + cancellation events for graph abort scenarios.
 
@@ -1187,6 +1320,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         message: Human-readable cancellation message
         iteration: Current iteration (included in state_delta when set)
         partial_output: Partial node output (included when set)
+        path: Execution path (included in state_delta when set)
 
     Returns:
         List of two events: [agent_state_event, cancellation_event]
@@ -1204,6 +1338,8 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
       state_delta["graph_iteration"] = iteration
     if partial_output is not None:
       state_delta["graph_partial_output"] = partial_output
+    if path is not None:
+      state_delta["graph_path"] = path
 
     cancel_event = Event(
         author=self.name,
@@ -1217,6 +1353,133 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     )
     return [state_event, cancel_event]
 
+  async def _execute_parallel_phase(
+      self,
+      group_id: str,
+      parallel_group: "ParallelNodeGroup",
+      current_node: GraphNode,
+      current_node_name: str,
+      state: GraphState,
+      ctx: InvocationContext,
+      effective_config: Optional["TelemetryConfig"],
+      agent_state: GraphAgentState,
+      executed_parallel_groups: set[str],
+      result: Dict[str, Any],
+  ) -> AsyncGenerator[Event, None]:
+    """Execute a parallel node group phase with telemetry.
+
+    Handles already-executed check, telemetry instrumentation,
+    parallel execution, group marking, and next-node routing.
+    Sets result["next"] to the next node name (or None if at end node).
+
+    Args:
+        group_id: Parallel group identifier
+        parallel_group: ParallelNodeGroup configuration
+        current_node: Current GraphNode (for edge routing)
+        current_node_name: Name of current node
+        state: Current graph state
+        ctx: Invocation context
+        effective_config: Telemetry config
+        agent_state: Execution tracking state
+        executed_parallel_groups: Set of already-executed group IDs (mutated)
+        result: Mutable dict; sets result["next"] to next node name or None
+
+    Yields:
+        Events from parallel execution
+
+    Raises:
+        ValueError: If parallel group has no outgoing edges and node is not
+            an end node
+    """
+    # Check if this group has already been executed
+    if group_id in executed_parallel_groups:
+      logger.info(
+          f"Skipping node '{current_node_name}' - already executed as"
+          f" part of parallel group '{group_id}'"
+      )
+      next_node_name = self._get_next_node_with_telemetry(
+          current_node, state, effective_config=effective_config
+      )
+      if next_node_name is None:
+        if current_node_name in self.end_nodes:
+          result["next"] = None
+          return
+        else:
+          raise ValueError(
+              f"Node {current_node_name} has no outgoing edges and is"
+              " not an end node"
+          )
+      result["next"] = next_node_name
+      return
+
+    # Execute entire parallel group
+    logger.info(
+        f"Executing parallel group '{group_id}' with nodes:"
+        f" {parallel_group.nodes}"
+    )
+
+    parallel_start_time = time.time()
+    with graph_tracing.tracer.start_as_current_span(
+        f"parallel_group {group_id}"
+    ) as pg_span:
+      attrs = self._get_telemetry_attributes(
+          {
+              graph_tracing.GRAPH_PARALLEL_NODE_COUNT: len(
+                  parallel_group.nodes
+              ),
+              graph_tracing.GRAPH_PARALLEL_STRATEGY: (
+                  parallel_group.join_strategy.value
+              ),
+              graph_tracing.GRAPH_PARALLEL_WAIT_N: parallel_group.wait_n,
+              graph_tracing.GRAPH_AGENT_NAME: self.name,
+          },
+          effective_config=effective_config,
+      )
+      for key, value in attrs.items():
+        pg_span.set_attribute(key, value)
+
+      completed_count = 0
+      async for event in execute_parallel_group(
+          parallel_group,
+          self.nodes,
+          state,
+          ctx,
+          self._execute_node,
+      ):
+        yield event
+        if event.author != self.name:
+          completed_count = min(completed_count + 1, len(parallel_group.nodes))
+
+      pg_span.set_attribute("graph.parallel.completed_count", completed_count)
+      if self._should_sample(effective_config=effective_config):
+        parallel_latency_ms = (time.time() - parallel_start_time) * 1000
+        graph_tracing.record_parallel_group_execution(
+            agent_name=self.name,
+            node_count=len(parallel_group.nodes),
+            strategy=parallel_group.join_strategy.value,
+            latency_ms=parallel_latency_ms,
+            completed_count=completed_count,
+        )
+
+    # Mark group as executed
+    executed_parallel_groups.add(group_id)
+    agent_state.executed_parallel_groups = list(executed_parallel_groups)
+
+    # Route to next node
+    next_node_name = self._get_next_node_with_telemetry(
+        current_node, state, effective_config=effective_config
+    )
+    if next_node_name is None:
+      if current_node_name in self.end_nodes:
+        result["next"] = None
+        return
+      else:
+        raise ValueError(
+            f"Parallel group '{group_id}' has no outgoing edges and"
+            f" node '{current_node_name}' is not an end node"
+        )
+    result["next"] = next_node_name
+
   @override
   async def _run_async_impl(
       self, ctx: InvocationContext
@@ -1224,7 +1487,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     """Core graph execution logic.
 
     Executes nodes in graph order, following conditional edges,
-    supporting loops and cyclic execution.
+    supporting loops and human-in-the-loop interrupts.
 
     Args:
         ctx: Invocation context
@@ -1237,6 +1500,10 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     """
     if not self.start_node:
       raise ValueError("Start node not set. Call set_start() first.")
+
+    # Register session with InterruptService if enabled
+    if self.interrupt_service:
+      self.interrupt_service.register_session(ctx.session.id)
 
     # Get effective telemetry config for nested graph inheritance
     effective_config = self._get_effective_telemetry_config(ctx)
@@ -1308,6 +1575,27 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
           iteration += 1
           current_node = self.nodes[current_node_name]
 
+          # Check for immediate cancellation (ESC-like interrupt)
+          # Allows user to abort execution at any time, not just at pause points
+          if self.interrupt_service and not self.interrupt_service.is_active(
+              ctx.session.id
+          ):
+            logger.info(
+                "GraphAgent execution cancelled (immediate interrupt) for"
+                f" session {ctx.session.id}"
+            )
+            for _ce in self._build_cancellation_events(
+                ctx,
+                agent_state,
+                current_node_name,
+                state,
+                message="Execution cancelled by user",
+                iteration=iteration,
+                path=list(agent_state.path),
+            ):
+              yield _ce
+            break  # Exit immediately but state is saved
+
           # Track execution path in agent_state
           agent_state.path.append(current_node_name)
           agent_state.iteration = iteration
@@ -1341,6 +1629,64 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
           else:
             resuming = False  # Only skip first iteration after resume
 
+          # Handle BEFORE-node interrupt (validation timing)
+          if (
+              self._should_interrupt_before(current_node_name)
+              and self.interrupt_service
+          ):
+            _b_events, _b_ctrl = await self._handle_before_node_interrupt(
+                current_node_name, current_node, state, ctx, agent_state
+            )
+            for _e in _b_events:
+              yield _e
+            # Persist agent_state after interrupt handler may have mutated it
+            ctx.set_agent_state(self.name, agent_state=agent_state)
+            yield self._create_agent_state_event(ctx)
+            if _b_ctrl == "break":
+              break
+            elif _b_ctrl is not None:
+              if isinstance(_b_ctrl, tuple):
+                current_node_name = _b_ctrl[1]
+              continue
+
+          # Check if current node is part of a parallel group
+          parallel_group_info = self._find_parallel_group(current_node_name)
+          if parallel_group_info:
+            group_id, parallel_group = parallel_group_info
+            _pg_result: Dict[str, Any] = {}
+            async for event in self._execute_parallel_phase(
+                group_id,
+                parallel_group,
+                current_node,
+                current_node_name,
+                state,
+                ctx,
+                effective_config,
+                agent_state,
+                executed_parallel_groups,
+                _pg_result,
+            ):
+              yield event
+            # Fire after_node_callback for parallel trigger node
+            if self.after_node_callback:
+              event = await self._execute_callback(
+                  self.after_node_callback,
+                  "after_node",
+                  current_node,
+                  current_node_name,
+                  state,
+                  iteration,
+                  ctx,
+                  agent_state,
+                  effective_config,
+              )
+              if event:
+                yield event
+            current_node_name = _pg_result.get("next")
+            if current_node_name is None:
+              break
+            continue
+
           # Invoke before_node_callback (custom observability)
           if self.before_node_callback:
             event = await self._execute_callback(
@@ -1357,104 +1703,8 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
             if event:
               yield event
 
-          # Check if current node is part of a parallel group
-          parallel_group_info = self._find_parallel_group(current_node_name)
-          if parallel_group_info:
-            group_id, parallel_group = parallel_group_info
-
-            if group_id in executed_parallel_groups:
-              logger.info(
-                  f"Skipping node '{current_node_name}' - already executed as"
-                  f" part of parallel group '{group_id}'"
-              )
-              next_node_name = self._get_next_node_with_telemetry(
-                  current_node, state
-              )
-              if next_node_name is None:
-                if current_node_name in self.end_nodes:
-                  break
-                else:
-                  raise ValueError(
-                      f"Node {current_node_name} has no outgoing edges and is"
-                      " not an end node"
-                  )
-              current_node_name = next_node_name
-              continue
-
-            logger.info(
-                f"Executing parallel group '{group_id}' with nodes:"
-                f" {parallel_group.nodes}"
-            )
-
-            parallel_start_time = time.time()
-            with graph_tracing.tracer.start_as_current_span(
-                f"parallel_group {group_id}"
-            ) as pg_span:
-              attrs = self._get_telemetry_attributes(
-                  {
-                      graph_tracing.GRAPH_PARALLEL_NODE_COUNT: len(
-                          parallel_group.nodes
-                      ),
-                      graph_tracing.GRAPH_PARALLEL_STRATEGY: (
-                          parallel_group.join_strategy.value
-                      ),
-                      graph_tracing.GRAPH_PARALLEL_WAIT_N: (
-                          parallel_group.wait_n
-                      ),
-                      graph_tracing.GRAPH_AGENT_NAME: self.name,
-                  },
-                  effective_config=effective_config,
-              )
-              for key, value in attrs.items():
-                pg_span.set_attribute(key, value)
-
-              completed_count = 0
-              async for event in execute_parallel_group(
-                  parallel_group,
-                  self.nodes,
-                  state,
-                  ctx,
-                  self._execute_node,
-              ):
-                yield event
-                if event.author != self.name:
-                  completed_count = min(
-                      completed_count + 1, len(parallel_group.nodes)
-                  )
-
-              pg_span.set_attribute(
-                  "graph.parallel.completed_count", completed_count
-              )
-              if self._should_sample(effective_config=effective_config):
-                parallel_latency_ms = (time.time() - parallel_start_time) * 1000
-                graph_tracing.record_parallel_group_execution(
-                    agent_name=self.name,
-                    node_count=len(parallel_group.nodes),
-                    strategy=parallel_group.join_strategy.value,
-                    latency_ms=parallel_latency_ms,
-                    completed_count=completed_count,
-                )
-
-            executed_parallel_groups.add(group_id)
-            agent_state.executed_parallel_groups = list(
-                executed_parallel_groups
-            )
-
-            next_node_name = self._get_next_node_with_telemetry(
-                current_node, state
-            )
-            if next_node_name is None:
-              if current_node_name in self.end_nodes:
-                break
-              else:
-                raise ValueError(
-                    f"Parallel group '{group_id}' has no outgoing edges and"
-                    f" node '{current_node_name}' is not an end node"
-                )
-            current_node_name = next_node_name
-            continue
-
-          # Execute node with output tracking
+          # Execute node with immediate cancellation support
+          # Check cancellation while streaming events from node execution
           output_holder: Dict[str, Any] = {"output": ""}
           try:
             async for event in self._execute_node(
@@ -1465,6 +1715,28 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
                 output_holder=output_holder,
                 iteration=iteration,
             ):
+              # Check for immediate cancellation DURING node execution
+              if (
+                  self.interrupt_service
+                  and not self.interrupt_service.is_active(ctx.session.id)
+              ):
+                logger.info(
+                    "GraphAgent execution cancelled (immediate interrupt"
+                    f" during node '{current_node_name}') for session"
+                    f" {ctx.session.id}"
+                )
+                for _ce in self._build_cancellation_events(
+                    ctx,
+                    agent_state,
+                    current_node_name,
+                    state,
+                    message=(
+                        f"Execution cancelled during node '{current_node_name}'"
+                    ),
+                    partial_output=output_holder["output"],
+                ):
+                  yield _ce
+                return
               yield event
           except asyncio.CancelledError:
             # Task cancelled externally (e.g., timeout, user abort)
@@ -1491,6 +1763,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
 
           # Sync session state + apply output_mapper/reducer
           output = output_holder["output"]
+          pre_ids = {k: id(v) for k, v in state.data.items()}
           state = self._sync_state_and_reduce(
               current_node,
               current_node_name,
@@ -1498,19 +1771,23 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
               ctx,
               output,
               effective_config,
+              agent_state=agent_state,
           )
 
           # Emit output_mapper changes as state_delta so domain data
           # flows through ADK's event pipeline to session.state.
           # This enables downstream LlmAgent nodes to read
           # output_mapper results via dynamic instructions.
-          if output:
+          # Uses object identity (id()) instead of equality (!=) for
+          # correctness and performance: sync assigns same references
+          # (same id), output_mapper creates new objects (different id).
+          if output is not None:
             delta = {}
             for _k, _v in state.data.items():
               if (
                   not _k.startswith("_")
                   and _k not in _GRAPH_INTERNAL_KEYS
-                  and ctx.session.state.get(_k) != _v
+                  and (_k not in pre_ids or pre_ids[_k] != id(_v))
               ):
                 delta[_k] = _v
             if delta:
@@ -1557,7 +1834,29 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
               partial=True,  # Mark as intermediate event
           )
 
+          # Handle AFTER-node interrupt (retrospective feedback timing)
+          # This enables retrospective feedback: observe past, steer future
+          if (
+              self._should_interrupt_after(current_node_name)
+              and self.interrupt_service
+          ):
+            _a_events, _a_ctrl = await self._handle_after_node_interrupt(
+                current_node_name, state, ctx, agent_state
+            )
+            for _e in _a_events:
+              yield _e
+            # Persist agent_state after interrupt handler may have mutated it
+            ctx.set_agent_state(self.name, agent_state=agent_state)
+            yield self._create_agent_state_event(ctx)
+            if _a_ctrl == "break":
+              break
+            elif _a_ctrl is not None:
+              if isinstance(_a_ctrl, tuple):
+                current_node_name = _a_ctrl[1]
+              continue
+
           # Checkpointing - yield event with state_delta to persist checkpoint
+          # Note: For full checkpoint/resume functionality, use CheckpointCallback
           if self.checkpointing:
             ctx.set_agent_state(self.name, agent_state=agent_state)
             yield self._create_agent_state_event(ctx)
@@ -1650,7 +1949,12 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
             yield self._create_agent_state_event(ctx)
 
       finally:
+        # Unregister session from InterruptService and finalize tracing
+        if self.interrupt_service:
+          self.interrupt_service.unregister_session(ctx.session.id)
         span.set_attribute("graph_agent.completed", True)
+
+  # Interrupt methods inherited from GraphInterruptMixin
 
   @override
   @classmethod
@@ -1684,6 +1988,16 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
 
     if hasattr(config, "checkpointing"):
       kwargs["checkpointing"] = config.checkpointing
+
+    # Interrupt configuration
+    if hasattr(config, "interrupt_config") and config.interrupt_config:
+      from .interrupt import InterruptConfig
+      from .interrupt import InterruptMode
+
+      interrupt_cfg = config.interrupt_config
+      if interrupt_cfg.mode:  # None = disabled, only process if mode is set
+        mode = InterruptMode(interrupt_cfg.mode)
+        kwargs["interrupt_config"] = InterruptConfig(mode=mode)
 
     # Callbacks
     from ..config_agent_utils import resolve_code_reference
@@ -1764,6 +2078,14 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
         if node_config.function_ref:
           function = resolve_code_reference(node_config.function_ref)
 
+        # Validate single agent per node
+        if len(sub_agents) > 1:
+          raise ValueError(
+              f"Node '{node_config.name}' has {len(sub_agents)} sub_agents"
+              " but GraphNode supports only one agent per node."
+              " Use ParallelNodeGroup for multi-agent execution."
+          )
+
         # Create GraphNode
         node = GraphNode(
             name=node_config.name,
@@ -1790,14 +2112,8 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
             weight=edge_config.weight,
         )
 
-        # Add edge directly to the node's edges list
-        if edge_config.source_node in graph.nodes:
-          graph.nodes[edge_config.source_node].edges.append(edge)
-          graph.nodes[edge_config.source_node]._sorted_edges_cache = None
-        else:
-          raise ValueError(
-              f"Source node {edge_config.source_node} not found in graph"
-          )
+        # Use public add_edge API for validation and dedup checks
+        graph.add_edge(edge_config.source_node, edge)
 
     # Set start node
     if hasattr(config, "start_node") and config.start_node:
@@ -1812,6 +2128,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
     if hasattr(config, "parallel_groups") and config.parallel_groups:
       from .parallel import ErrorPolicy
       from .parallel import JoinStrategy
+      from .parallel import ParallelNodeGroup
 
       for pg_config in config.parallel_groups:
         join_strategy = JoinStrategy(pg_config.join_strategy)
@@ -1823,6 +2140,7 @@ class GraphAgent(GraphTelemetryMixin, BaseAgent):  # type: ignore[misc]
             error_policy=error_policy,
             wait_n=pg_config.wait_n,
         )
+        # Store parallel group (keyed by first node name for simplicity)
         graph.parallel_groups[pg_config.nodes[0]] = parallel_group
 
     return graph
