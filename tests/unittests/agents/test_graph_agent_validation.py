@@ -217,15 +217,18 @@ def test_ast_rejects_dunder_attribute_access():
 
   # Dunder attribute access should be rejected
   tree = ast.parse("data.__class__", mode="eval")
-  with pytest.raises(ValueError, match="Unsafe attribute access.*__class__"):
+  with pytest.raises(
+      ValueError, match="Unsafe dunder attribute access.*__class__"
+  ):
     _validate_condition_ast(tree.body)
 
   # Nested dunder chain should be rejected (outermost attr checked first)
   tree = ast.parse("data.__class__.__init__", mode="eval")
-  with pytest.raises(ValueError, match="Unsafe attribute access.*__init__"):
+  with pytest.raises(
+      ValueError, match="Unsafe dunder attribute access.*__init__"
+  ):
     _validate_condition_ast(tree.body)
 
-  # Single underscore prefix should also be rejected
+  # Single underscore prefix is allowed (cannot enable sandbox escape)
   tree = ast.parse("data._private", mode="eval")
-  with pytest.raises(ValueError, match="Unsafe attribute access.*_private"):
-    _validate_condition_ast(tree.body)
+  _validate_condition_ast(tree.body)  # Should not raise

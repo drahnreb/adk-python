@@ -171,7 +171,7 @@ async def test_interrupt_reasoner_decides_go_back():
 
 @pytest.mark.asyncio
 async def test_interrupt_reasoner_fallback_on_exception():
-  """Test reasoner falls back to continue on any exception."""
+  """Test reasoner falls back to pause on any exception (fail-safe)."""
 
   class FailingReasoner(InterruptReasoner):
     """Reasoner that returns invalid JSON causing parse failure."""
@@ -193,8 +193,8 @@ async def test_interrupt_reasoner_fallback_on_exception():
 
   action = await reasoner.reason_about_interrupt(message, state, "node", ctx)
 
-  # Should fall back to continue (exception handled gracefully)
-  assert action.action == "continue"
+  # Should fall back to pause (fail-safe: don't auto-continue on error)
+  assert action.action == "pause"
 
 
 @pytest.mark.asyncio
@@ -212,8 +212,8 @@ async def test_interrupt_reasoner_validates_action():
 
   action = await reasoner.reason_about_interrupt(message, state, "node", ctx)
 
-  # Should default to continue
-  assert action.action == "continue"
+  # Should fall back to pause (fail-safe)
+  assert action.action == "pause"
 
 
 @pytest.mark.asyncio
@@ -607,7 +607,9 @@ def test_build_reasoning_prompt_truncates_large_state():
   Creates a large state dict so that json.dumps produces more chars than
   max_state_size, triggering the slice-and-append branch at line 205.
   """
-  config = InterruptReasonerConfig(max_state_size=50)  # tiny limit
+  config = InterruptReasonerConfig(
+      max_state_size=50, include_state_in_prompt=True
+  )
   reasoner = InterruptReasoner(config)
 
   # Build a state whose JSON representation is definitely > 50 chars
@@ -645,8 +647,8 @@ async def test_reason_validates_action_against_available_actions():
 
   action = await reasoner.reason_about_interrupt(message, state, "node", ctx)
 
-  # Invalid action should fall back to "continue" (default fallback)
-  assert action.action == "continue"
+  # Invalid action should fall back to "pause" (fail-safe fallback)
+  assert action.action == "pause"
 
 
 @pytest.mark.asyncio
@@ -673,7 +675,7 @@ def test_build_reasoning_prompt_uses_data_to_json():
   """Prompt uses state.data_to_json() for Pydantic-safe serialization."""
   from google.adk.agents.graph.graph_agent_state import GraphAgentState
 
-  config = InterruptReasonerConfig()
+  config = InterruptReasonerConfig(include_state_in_prompt=True)
   reasoner = InterruptReasoner(config)
 
   state = GraphState(data={"key": "value"})
@@ -691,8 +693,8 @@ def test_build_reasoning_prompt_uses_data_to_json():
 
 
 def test_build_reasoning_prompt_hides_state():
-  """State is hidden when include_state_in_prompt is False."""
-  config = InterruptReasonerConfig(include_state_in_prompt=False)
+  """State is hidden by default (include_state_in_prompt=False)."""
+  config = InterruptReasonerConfig()  # default: include_state_in_prompt=False
   reasoner = InterruptReasoner(config)
 
   state = GraphState(data={"secret": "supersecretvalue123"})
@@ -708,7 +710,7 @@ def test_interrupt_reasoner_config_defaults():
   """Config defaults are initialized correctly."""
   config = InterruptReasonerConfig()
 
-  assert config.fallback_action == "continue"
+  assert config.fallback_action == "pause"  # fail-safe: pause, not continue
   assert "continue" in config.available_actions
   assert "rerun" in config.available_actions
   assert "go_back" in config.available_actions
@@ -716,7 +718,9 @@ def test_interrupt_reasoner_config_defaults():
   assert "defer" in config.available_actions
   assert "skip" in config.available_actions
   assert config.custom_actions == {}
-  assert config.include_state_in_prompt is True
+  assert (
+      config.include_state_in_prompt is False
+  )  # opt-in: state may contain PII
   assert config.max_state_size == 10000
 
 

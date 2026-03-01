@@ -28,13 +28,17 @@ class StateReducer(str, Enum):
   """State reduction strategies for merging node outputs.
 
   Defines how node outputs are merged into the graph state:
-  - OVERWRITE: Replace existing value with new value
+  - OVERWRITE: Replace existing value with new value (default for agent nodes)
+  - MERGE: Merge output into state.data (default for function nodes).
+      Dict returns are spread into state.data (each key becomes a top-level
+      state key). Non-dict returns fall back to OVERWRITE behavior.
   - APPEND: Append new value to list (creates list if needed)
   - SUM: Accumulate values using + operator (works for strings, numbers, lists)
   - CUSTOM: Use custom reducer function
   """
 
   OVERWRITE = "overwrite"
+  MERGE = "merge"
   APPEND = "append"
   SUM = "sum"
   CUSTOM = "custom"

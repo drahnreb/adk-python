@@ -430,3 +430,57 @@ async def test_merge_order_is_deterministic_by_definition_order():
 
   # "fast" is defined AFTER "slow" in group.nodes, so fast's value wins
   assert state.data["shared_key"] == "from_fast"
+
+
+class TestKeyReducers:
+  """Tests for per-key reducers in ParallelNodeGroup."""
+
+  def test_key_reducer_append(self):
+    """Append reducer stores correctly."""
+    group = ParallelNodeGroup(
+        nodes=["a", "b"],
+        key_reducers={"results": "append"},
+    )
+    assert group.key_reducers == {"results": "append"}
+
+  def test_key_reducer_sum(self):
+    """Sum reducer stores correctly."""
+    group = ParallelNodeGroup(
+        nodes=["a", "b"],
+        key_reducers={"total": "sum"},
+    )
+    assert group.key_reducers == {"total": "sum"}
+
+  def test_key_reducer_merge_dicts(self):
+    """Merge reducer stores correctly."""
+    group = ParallelNodeGroup(
+        nodes=["a", "b"],
+        key_reducers={"config": "merge"},
+    )
+    assert group.key_reducers == {"config": "merge"}
+
+  def test_key_reducer_custom_callable(self):
+    """Custom callable reducer stored by identity."""
+
+    def my_reducer(old, new):
+      return (old or 0) + new * 2
+
+    group = ParallelNodeGroup(
+        nodes=["a", "b"],
+        key_reducers={"score": my_reducer},
+    )
+    assert group.key_reducers["score"] is my_reducer
+    assert my_reducer(10, 5) == 20
+
+  def test_key_reducer_mixed(self):
+    """Mix of reducer strategies."""
+    group = ParallelNodeGroup(
+        nodes=["a", "b", "c"],
+        key_reducers={"log": "append", "count": "sum", "config": "merge"},
+    )
+    assert len(group.key_reducers) == 3
+
+  def test_key_reducer_default_empty(self):
+    """No key_reducers -> empty dict."""
+    group = ParallelNodeGroup(nodes=["a", "b"])
+    assert group.key_reducers == {}

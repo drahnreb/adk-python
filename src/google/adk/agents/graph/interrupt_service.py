@@ -222,6 +222,7 @@ class InterruptService:
     """
     self.config = config or InterruptServiceConfig()
     self._message_queues: Dict[str, "asyncio.Queue[InterruptMessage]"] = {}
+    self._message_history: Dict[str, List[InterruptMessage]] = {}
     self._pause_events: Dict[str, asyncio.Event] = {}
     self._cancellation_events: Dict[str, asyncio.Event] = {}
     self._session_metrics: Dict[str, SessionMetrics] = {}
@@ -363,6 +364,7 @@ class InterruptService:
       self._message_queues[session_id] = asyncio.Queue(
           maxsize=self.config.max_queue_size
       )
+      self._message_history[session_id] = []
       self._pause_events[session_id] = asyncio.Event()
       self._pause_events[session_id].set()  # Start unpaused
       self._cancellation_events[session_id] = asyncio.Event()
@@ -393,6 +395,7 @@ class InterruptService:
         session_id: Session identifier
     """
     self._message_queues.pop(session_id, None)
+    self._message_history.pop(session_id, None)
     self._pause_events.pop(session_id, None)
     self._cancellation_events.pop(session_id, None)
     self._session_metrics.pop(session_id, None)
@@ -630,6 +633,7 @@ class InterruptService:
       await asyncio.wait_for(
           self._message_queues[session_id].put(message), timeout=timeout
       )
+      self._message_history.setdefault(session_id, []).append(message)
 
       # Update activity timestamp
       self._update_activity(session_id)
@@ -769,14 +773,10 @@ class InterruptService:
     if page_size < 1 or page_size > 1000:
       page_size = 50
 
-    if session_id not in self._message_queues:
+    if session_id not in self._message_history:
       return []
 
-    # Direct deque access: non-destructive read of the underlying deque.
-    # asyncio.Queue stores items in _queue (a collections.deque).
-    # This avoids drain/requeue and eliminates QueueFull risk.
-    queue = self._message_queues[session_id]
-    messages = list(queue._queue)  # type: ignore[attr-defined]
+    messages = self._message_history[session_id]
     offset = (page - 1) * page_size
     return messages[offset : offset + page_size]
 
